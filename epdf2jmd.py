@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-from collections import Counter
 import os
 import re
 import shutil
@@ -41,6 +40,7 @@ CODEX_MODEL = "gpt-5.6-luna"
 CODEX_REASONING_EFFORT = "low"
 CODEX_TIMEOUT_SECONDS = 1800
 SKIP_CODEX = False
+PROMPT_FILENAME = "prompt.md"
 
 # Codex出力の簡易検査
 MIN_OUTPUT_LENGTH_RATIO = 0.65
@@ -613,36 +613,33 @@ def build_translation_markdown(
 
     return "\n".join(lines).strip() + "\n"
 
+def get_prompt_path() -> Path:
+    """実行中のPythonファイルと同じ階層にあるprompt.mdを返す。"""
+    return Path(__file__).resolve().parent / PROMPT_FILENAME
+
+
+def load_codex_prompt_template() -> str:
+    """Codexへ渡す指示文をprompt.mdから読み込む。"""
+    prompt_path = get_prompt_path()
+
+    if not prompt_path.exists():
+        raise RuntimeError(
+            f"プロンプトファイルが見つかりません。\n\n"
+            f"次の場所に {PROMPT_FILENAME} を置いてください。\n"
+            f"{prompt_path}"
+        )
+
+    template = prompt_path.read_text(encoding="utf-8").strip()
+    if not template:
+        raise RuntimeError(f"{prompt_path} が空です。")
+
+    return template
+
+
 def build_codex_prompt(input_markdown: str) -> str:
-    return rf"""以下は、英語論文をPDFから抽出し、Google翻訳したMarkdownです。
-日本語訳やMarkdown構造がかなり崩れているため、文脈を踏まえて読みやすい日本語の論文として整えてください。
-
-最優先事項:
-- 最後まで読める完成したMarkdownを必ず出力する。
-- 元の章・節・内容・論旨・数値・引用番号をできる限り維持する。
-- PDF抽出による改行、単語分断、ページをまたぐ文、見出し、箇条書き、表を自然に修正する。
-- 不自然な機械翻訳は、前後の文脈から意味を推測して自然な学術日本語に直す。
-- 数式が崩れている場合は、周辺の説明と数式断片から妥当なLaTeXを推測して修復してよい。
-- 数式を修復できない場合も削除せず、最も妥当と思われる形で残す。
-- 完璧な忠実性より、内容を欠落させず最後まで完成させることを優先する。
-
-整形条件:
-- 内容を要約しすぎたり、論文にない新しい主張や結論を追加したりしない。
-- 明らかな重複ヘッダー、フッター、ページ番号、途中に混入した著者名や短縮タイトルは削除してよい。
-- 見出し、箇条書き、表、図表キャプションをMarkdownとして読みやすく整える。
-- 文体は原則として「である調」に統一する。
-- 専門用語、固有名詞、引用番号、URL、数値、単位は可能な限り維持する。
-- 1行目の原文PDFリンクは残す。
-- `![[...]]` 形式のObsidian画像埋め込みは残し、対応する図キャプションの直前へ置く。
-- `<!-- page: N -->` コメントは残しても削除してもよい。
-- 思考過程、作業説明、前置き、後書きを出力しない。
-- Markdown全体をコードフェンスで囲まない。
-- 校正後のMarkdown本文だけを出力する。
-
-入力Markdown:
-
-{input_markdown}
-"""
+    """prompt.mdの指示文と処理対象Markdownを結合する。"""
+    template = load_codex_prompt_template()
+    return f"{template}\n\n---\n\n# 入力Markdown\n\n{input_markdown}"
 
 
 # ============================================================
@@ -754,56 +751,6 @@ def clean_codex_output(text: str) -> str:
     return text
 
 
-def remove_nonvisible_comments(text: str) -> str:
-    return re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL).strip()
-
-
-def inspect_codex_output(source: str, result: str) -> list[str]:
-    """Codex出力を採否判定せず、確認事項だけを返す。"""
-    warnings: list[str] = []
-
-    if not result.strip():
-        return ["Codexの出力が空です。"]
-
-    lowered = result.lower()
-    for pattern in INVALID_OUTPUT_PATTERNS:
-        if pattern.lower() in lowered:
-            warnings.append(f"作業メモと思われる文字列を検出しました: {pattern}")
-            break
-
-    source_visible = remove_nonvisible_comments(source)
-    result_visible = remove_nonvisible_comments(result)
-    if source_visible:
-        length_ratio = len(result_visible) / len(source_visible)
-        if length_ratio < MIN_OUTPUT_LENGTH_RATIO:
-            warnings.append(
-                "出力が入力に比べて短めです。"
-                f" 入力={len(source_visible):,}文字、出力={len(result_visible):,}文字、比率={length_ratio:.1%}"
-            )
-
-    source_images = re.findall(r"!\[\[[^\]]+\]\]", source)
-    result_images = re.findall(r"!\[\[[^\]]+\]\]", result)
-    if Counter(source_images) != Counter(result_images):
-        warnings.append("画像リンクの個数または内容が変化しています。")
-
-    pdf_link_match = re.match(r"^\s*(\[原文PDF\]\([^\n]+\))", source)
-    if pdf_link_match and pdf_link_match.group(1) not in result:
-        warnings.append("原文PDFリンクがCodex出力から欠落しています。")
-
-    return warnings
-
-
-def build_full_warning(path: Path, reason: str) -> None:
-    lines = [
-        "# Codex校正確認",
-        "",
-        "Codex出力は最終ファイルとして保存したが、次の確認事項がある。",
-        "",
-        f"- 理由: {reason}",
-        "",
-        "必要に応じて元PDFと照合すること。",
-    ]
-    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
 # ============================================================
@@ -857,11 +804,6 @@ def save_original_text(path: Path, pages: list[str]) -> Path:
     return path
 
 
-def save_rejected_output(path: Path, candidate: str) -> Path:
-    path.write_text(candidate.rstrip() + "\n", encoding="utf-8")
-    return path
-
-
 # ============================================================
 # メイン処理
 # ============================================================
@@ -877,16 +819,12 @@ def main() -> int:
     original_path = paper_dir / "[en]原文抽出.txt"
     translation_path = paper_dir / "[mt]機械翻訳.md"
     final_path = paper_dir / "[ja]翻訳.md"
-    codex_warning_path = paper_dir / "[warning]Codex全文確認.md"
-    rejected_path = paper_dir / "[warning]Codex不採用出力.md"
     pdf_link_line = build_pdf_link(pdf_path, paper_dir)
 
     print("=" * 60)
     print(f"対象PDF: {pdf_path}")
     print(f"出力先: {paper_dir}")
     print("=" * 60)
-
-    warning_paths: list[Path] = []
 
     try:
         if not SKIP_CODEX:
@@ -927,12 +865,6 @@ def main() -> int:
         )
         print(f"  機械翻訳結果を保存しました: {translation_path}")
 
-        # 前回実行時の警告ファイルが残っていると紛らわしいため削除する。
-        for stale_path in (codex_warning_path, rejected_path):
-            try:
-                stale_path.unlink()
-            except FileNotFoundError:
-                pass
 
         if SKIP_CODEX:
             print("\n5/6 Codex処理は設定によりスキップされました。")
@@ -940,6 +872,7 @@ def main() -> int:
         else:
             print("\n5/6 Codex CLIでMarkdown全文を一括校正しています。")
             print(f"  使用モデル: {CODEX_MODEL}")
+            print(f"  プロンプト: {get_prompt_path()}")
             print(f"  推論量: {CODEX_REASONING_EFFORT}")
             print("  英語原文は送信しません。")
             print("  数式を含む機械翻訳全文を渡し、文脈からの修復も許可します。")
@@ -951,22 +884,11 @@ def main() -> int:
                     raise RuntimeError("Codexの出力が空でした。")
 
                 final_text = candidate
-                notices = inspect_codex_output(readable_machine_markdown, candidate)
-                if notices:
-                    build_full_warning(codex_warning_path, " / ".join(notices))
-                    warning_paths.append(codex_warning_path)
-                    print("  [注意] 校正版は保存しますが、確認事項があります。")
-                    for notice in notices:
-                        print(f"    - {notice}")
-                else:
-                    print("  Codex校正版を最終結果として採用します。")
+                print("  Codex校正版を最終結果として採用します。")
             except Exception as exc:
                 # Codex自体が失敗した場合に限り、機械翻訳版へフォールバックする。
                 final_text = readable_machine_markdown
-                reason = str(exc)
-                build_full_warning(codex_warning_path, f"Codex処理に失敗したため機械翻訳版を保存した: {reason}")
-                warning_paths.append(codex_warning_path)
-                print(f"  [警告] Codex処理に失敗したため機械翻訳版を使用します: {reason}")
+                print(f"  [警告] Codex処理に失敗したため機械翻訳版を使用します: {exc}")
 
         print("\n6/6 最終ファイルを保存しています。")
         final_path.write_text(final_text.rstrip() + "\n", encoding="utf-8")
@@ -980,7 +902,6 @@ def main() -> int:
     paths = [original_path, translation_path, final_path]
     if assets_dir.exists():
         paths.append(assets_dir)
-    paths.extend(warning_paths)
 
     print("\n" + "=" * 60)
     print("処理が完了しました。")
