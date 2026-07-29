@@ -15,7 +15,6 @@ from pathlib import Path
 from tkinter import filedialog, messagebox
 
 import pymupdf
-from deep_translator import GoogleTranslator
 
 
 # ============================================================
@@ -30,10 +29,6 @@ MIN_DIRECT_TEXT_LENGTH = 80
 OCR_DPI = 300
 TESSDATA_PATH: str | None = None
 
-# Google翻訳
-TRANSLATION_CHUNK_SIZE = 3500
-MAX_TRANSLATION_RETRIES = 3
-TRANSLATION_INTERVAL_SECONDS = 0.5
 
 # Codex CLI
 CODEX_MODEL = "gpt-5.6-luna"
@@ -444,95 +439,6 @@ def extract_pdf_images(
 
 
 # ============================================================
-# Google翻訳
-# ============================================================
-
-
-def split_long_text(text: str, max_length: int) -> list[str]:
-    text = text.strip()
-    if not text:
-        return []
-
-    chunks: list[str] = []
-
-    while len(text) > max_length:
-        area = text[:max_length]
-        candidates = [
-            area.rfind("\n\n"),
-            area.rfind(". "),
-            area.rfind("? "),
-            area.rfind("! "),
-            area.rfind("; "),
-            area.rfind(", "),
-            area.rfind(" "),
-        ]
-        split_at = max(candidates)
-        split_at = max_length if split_at < max_length // 2 else split_at + 1
-
-        chunk = text[:split_at].strip()
-        if chunk:
-            chunks.append(chunk)
-        text = text[split_at:].strip()
-
-    if text:
-        chunks.append(text)
-
-    return chunks
-
-
-def translate_chunk(
-    translator: GoogleTranslator,
-    chunk: str,
-    number: int,
-    total: int,
-) -> str:
-    for attempt in range(1, MAX_TRANSLATION_RETRIES + 1):
-        try:
-            print(f"[翻訳] {number}/{total} ({len(chunk)}文字)")
-            translated = translator.translate(text=chunk)
-            if not translated:
-                raise RuntimeError("翻訳結果が空でした。")
-            return translated
-        except Exception as exc:
-            if attempt >= MAX_TRANSLATION_RETRIES:
-                raise RuntimeError(
-                    f"翻訳チャンク {number} の処理に失敗しました。\n\n詳細:\n{exc}"
-                ) from exc
-
-            wait = 3 * attempt
-            print(f"  翻訳に失敗したため、{wait}秒後に再試行します。")
-            time.sleep(wait)
-
-    raise RuntimeError("翻訳処理で予期しないエラーが発生しました。")
-
-
-def translate_pages(page_texts: list[str]) -> list[str]:
-    translator = GoogleTranslator(source=SOURCE_LANGUAGE, target=TARGET_LANGUAGE)
-
-    page_chunks = [split_long_text(text, TRANSLATION_CHUNK_SIZE) for text in page_texts]
-    total_chunks = sum(len(chunks) for chunks in page_chunks)
-
-    translated_pages: list[str] = []
-    current_number = 0
-
-    for page_number, chunks in enumerate(page_chunks, start=1):
-        translated_chunks: list[str] = []
-
-        for chunk in chunks:
-            current_number += 1
-            translated_chunks.append(
-                translate_chunk(translator, chunk, current_number, total_chunks)
-            )
-            time.sleep(TRANSLATION_INTERVAL_SECONDS)
-
-        translated_page = "\n\n".join(translated_chunks)
-        translated_pages.append(translated_page)
-        print(f"  ページ {page_number} の翻訳が完了しました。")
-
-    return translated_pages
-
-
-# ============================================================
 # Markdown生成
 # ============================================================
 
@@ -582,24 +488,24 @@ def insert_images_near_captions(
     return result
 
 
-def build_translation_markdown(
+def build_source_markdown(
     pdf_link_line: str,
-    translated_pages: list[str],
+    original_pages: list[str],
     images_by_page: dict[int, list[ExtractedImage]],
 ) -> str:
-    """プレースホルダーを含むCodex入力用Markdownを作る。"""
+    """Codexへ渡す英語原文Markdownを作る。"""
     lines = [
         pdf_link_line,
         "",
-        "# 機械翻訳",
+        "# Extracted English Source",
         "",
-        "> PDFから自動抽出またはOCRし、Google翻訳した未校正の中間結果である。",
-        "> 数式は一時プレースホルダーとして保護されている。",
+        "> This text was automatically extracted from the PDF or obtained by OCR.",
+        "> Reading order, equations, headings, tables, and line breaks may be broken.",
         "",
     ]
 
-    for page_number, text in enumerate(translated_pages, start=1):
-        page_content = text or "（翻訳できる文章がありませんでした）"
+    for page_number, text in enumerate(original_pages, start=1):
+        page_content = text or "(No extractable text was found on this page.)"
         page_content = insert_images_near_captions(
             page_content,
             images_by_page.get(page_number, []),
@@ -612,6 +518,7 @@ def build_translation_markdown(
         ])
 
     return "\n".join(lines).strip() + "\n"
+
 
 def get_prompt_path() -> Path:
     """実行中のPythonファイルと同じ階層にあるprompt.mdを返す。"""
@@ -637,9 +544,9 @@ def load_codex_prompt_template() -> str:
 
 
 def build_codex_prompt(input_markdown: str) -> str:
-    """prompt.mdの指示文と処理対象Markdownを結合する。"""
+    """prompt.mdの指示文と英語原文Markdownを結合する。"""
     template = load_codex_prompt_template()
-    return f"{template}\n\n---\n\n# 入力Markdown\n\n{input_markdown}"
+    return f"{template}\n\n---\n\n# 翻訳対象の英語Markdown\n\n{input_markdown}"
 
 
 # ============================================================
@@ -699,7 +606,7 @@ def run_codex_polish(input_markdown: str) -> str:
             "-",
         ]
 
-        print(f"  Markdown全文 {len(prompt):,}文字をCodexへ1回だけ送信します。")
+        print(f"  英語Markdown全文 {len(prompt):,}文字をCodexへ1回だけ送信します。")
 
         try:
             result = subprocess.run(
@@ -817,7 +724,6 @@ def main() -> int:
 
     paper_dir, assets_dir = create_output_layout(pdf_path)
     original_path = paper_dir / "[en]原文抽出.txt"
-    translation_path = paper_dir / "[mt]機械翻訳.md"
     final_path = paper_dir / "[ja]翻訳.md"
     pdf_link_line = build_pdf_link(pdf_path, paper_dir)
 
@@ -828,69 +734,52 @@ def main() -> int:
 
     try:
         if not SKIP_CODEX:
-            print("\n1/6 Codex CLIを確認しています。")
+            print("\n1/5 Codex CLIを確認しています。")
             check_codex_cli()
         else:
-            print("\n1/6 Codex CLI確認をスキップします。")
+            print("\n1/5 Codex CLI確認をスキップします。")
 
-        print("\n2/6 PDFから文章を取得しています。")
+        print("\n2/5 PDFから文章を取得しています。")
         original_pages = extract_pdf_text(pdf_path)
         if not any(text.strip() for text in original_pages):
             raise RuntimeError("PDFから文章を取得できませんでした。")
         save_original_text(original_path, original_pages)
 
-        print("\n3/6 数式を退避し、PDF画像を抽出しています。")
-        protected_pages, math_store = protect_math_pages(original_pages)
-        print(f"  退避した数式候補: {len(math_store)}個")
-
+        print("\n3/5 PDF画像を抽出しています。")
         images_by_page = extract_pdf_images(pdf_path, assets_dir)
         image_count = sum(len(items) for items in images_by_page.values())
         print(f"  抽出した画像: {image_count}枚")
 
-        print("\n4/6 Google翻訳を実行しています。")
-        translated_pages = translate_pages(protected_pages)
-
-        protected_machine_markdown = build_translation_markdown(
+        source_markdown = build_source_markdown(
             pdf_link_line=pdf_link_line,
-            translated_pages=translated_pages,
+            original_pages=original_pages,
             images_by_page=images_by_page,
         )
-        readable_machine_markdown = restore_math_placeholders(
-            protected_machine_markdown,
-            math_store,
-        )
-        translation_path.write_text(
-            readable_machine_markdown.rstrip() + "\n",
-            encoding="utf-8",
-        )
-        print(f"  機械翻訳結果を保存しました: {translation_path}")
-
 
         if SKIP_CODEX:
-            print("\n5/6 Codex処理は設定によりスキップされました。")
-            final_text = readable_machine_markdown
+            print("\n4/5 Codex処理は設定によりスキップされました。")
+            final_text = source_markdown
         else:
-            print("\n5/6 Codex CLIでMarkdown全文を一括校正しています。")
+            print("\n4/5 Codex CLIで英語原文を日本語へ直接翻訳・整形しています。")
             print(f"  使用モデル: {CODEX_MODEL}")
             print(f"  プロンプト: {get_prompt_path()}")
             print(f"  推論量: {CODEX_REASONING_EFFORT}")
-            print("  英語原文は送信しません。")
-            print("  数式を含む機械翻訳全文を渡し、文脈からの修復も許可します。")
-            print("  Codexが空出力にならない限り、校正版を最終結果として保存します。")
+            print("  Google翻訳は使用しません。")
+            print("  抽出した英語全文を渡し、日本語翻訳・構造復元・数式整形を1回で行います。")
 
             try:
-                candidate = run_codex_polish(readable_machine_markdown)
+                candidate = run_codex_polish(source_markdown)
                 if not candidate.strip():
                     raise RuntimeError("Codexの出力が空でした。")
 
                 final_text = candidate
-                print("  Codex校正版を最終結果として採用します。")
+                print("  Codex翻訳版を最終結果として採用します。")
             except Exception as exc:
-                # Codex自体が失敗した場合に限り、機械翻訳版へフォールバックする。
-                final_text = readable_machine_markdown
-                print(f"  [警告] Codex処理に失敗したため機械翻訳版を使用します: {exc}")
+                # 翻訳結果が作れないことを避けるため、Codex失敗時は英語抽出版を保存する。
+                final_text = source_markdown
+                print(f"  [警告] Codex処理に失敗したため英語抽出版を保存します: {exc}")
 
-        print("\n6/6 最終ファイルを保存しています。")
+        print("\n5/5 最終ファイルを保存しています。")
         final_path.write_text(final_text.rstrip() + "\n", encoding="utf-8")
 
     except Exception as exc:
@@ -899,7 +788,7 @@ def main() -> int:
         show_error(message)
         return 1
 
-    paths = [original_path, translation_path, final_path]
+    paths = [original_path, final_path]
     if assets_dir.exists():
         paths.append(assets_dir)
 
