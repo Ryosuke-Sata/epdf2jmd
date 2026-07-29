@@ -594,7 +594,7 @@ def run_codex_polish(input_markdown: str) -> str:
             "--model",
             CODEX_MODEL,
             "-c",
-            f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"',
+            f"model_reasoning_effort={CODEX_REASONING_EFFORT}",
             "--output-last-message",
             str(output_path),
             "-",
