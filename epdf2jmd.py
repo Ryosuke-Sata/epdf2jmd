@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import os
 import re
@@ -23,12 +24,6 @@ import pymupdf
 
 SOURCE_LANGUAGE = "en"
 TARGET_LANGUAGE = "ja"
-
-# PDF文字抽出・OCR
-MIN_DIRECT_TEXT_LENGTH = 80
-OCR_DPI = 300
-TESSDATA_PATH: str | None = None
-
 
 # Codex CLI
 CODEX_MODEL = "gpt-5.6-luna"
@@ -85,15 +80,22 @@ class ExtractedImage:
 
 def select_pdf_file() -> Path | None:
     root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
+    try:
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.update_idletasks()
 
-    selected = filedialog.askopenfilename(
-        title="翻訳する英語PDFを選択してください",
-        filetypes=[("PDFファイル", "*.pdf")],
-    )
+        dialog_options = {
+            "title": "翻訳する英語PDFを選択してください",
+            "filetypes": [("PDFファイル", "*.pdf")],
+        }
+        if sys.platform != "darwin":
+            dialog_options["parent"] = root
 
-    root.destroy()
+        selected = filedialog.askopenfilename(**dialog_options)
+    finally:
+        root.destroy()
+
     return Path(selected) if selected else None
 
 
@@ -113,7 +115,7 @@ def show_success(paths: list[Path]) -> None:
 
 
 # ============================================================
-# PDF文字抽出・OCR
+# PDF文字抽出
 # ============================================================
 
 
@@ -158,32 +160,9 @@ def extract_text_from_blocks(page: pymupdf.Page) -> str:
     return "\n\n".join(parts)
 
 
-def extract_page_text(page: pymupdf.Page, page_number: int) -> tuple[str, str]:
+def extract_page_text(page: pymupdf.Page) -> tuple[str, str]:
     direct_text = extract_text_from_blocks(page)
-    if len(direct_text) >= MIN_DIRECT_TEXT_LENGTH:
-        return direct_text, "直接抽出"
-
-    print(f"  ページ {page_number}: 文字情報が少ないためOCRを実行します。")
-
-    try:
-        text_page = page.get_textpage_ocr(
-            language="eng",
-            dpi=OCR_DPI,
-            full=True,
-            tessdata=TESSDATA_PATH,
-        )
-        ocr_text = page.get_text("text", textpage=text_page)
-        ocr_text = "\n\n".join(
-            part for part in (normalize_text_block(block) for block in re.split(r"\n\s*\n", ocr_text))
-            if part
-        )
-        return (ocr_text, "OCR") if ocr_text else (direct_text, "抽出結果なし")
-    except Exception as exc:
-        raise RuntimeError(
-            f"{page_number}ページ目のOCRに失敗しました。\n"
-            "Tesseract OCRが正しくインストールされているか確認してください。\n\n"
-            f"詳細:\n{exc}"
-        ) from exc
+    return (direct_text, "直接抽出") if direct_text else ("", "抽出結果なし")
 
 
 def extract_pdf_text(pdf_path: Path) -> list[str]:
@@ -192,7 +171,7 @@ def extract_pdf_text(pdf_path: Path) -> list[str]:
     with pymupdf.open(pdf_path) as document:
         for index, page in enumerate(document, start=1):
             print(f"[文字抽出] {index}/{document.page_count}ページ")
-            text, method = extract_page_text(page, index)
+            text, method = extract_page_text(page)
             print(f"  -> {method}: {len(text)}文字")
             page_texts.append(text)
 
@@ -499,7 +478,7 @@ def build_source_markdown(
         "",
         "# Extracted English Source",
         "",
-        "> This text was automatically extracted from the PDF or obtained by OCR.",
+        "> This text was automatically extracted from the PDF.",
         "> Reading order, equations, headings, tables, and line breaks may be broken.",
         "",
     ]
@@ -554,16 +533,34 @@ def build_codex_prompt(input_markdown: str) -> str:
 # ============================================================
 
 
+def find_codex_cli() -> str:
+    """PATHからCodex CLIを探す。Windowsではnpmのcodex.cmdも対象になる。"""
+    candidates = ("codex.exe", "codex.cmd", "codex.bat", "codex") if os.name == "nt" else ("codex",)
+    for candidate in candidates:
+        executable = shutil.which(candidate)
+        if executable is not None:
+            return executable
+    raise RuntimeError(
+        "Codex CLIが見つかりません。\n\n"
+        "コマンドプロンプトまたはターミナルで codex --version を確認してください。"
+    )
+
+
+def codex_command(executable: str, *arguments: str) -> list[str]:
+    """Codexの実行コマンドをOSに合わせて組み立てる。"""
+    command = [executable, *arguments]
+    if os.name == "nt" and Path(executable).suffix.lower() in {".cmd", ".bat"}:
+        command_line = subprocess.list2cmdline(command)
+        command_prompt = os.environ.get("COMSPEC") or shutil.which("cmd.exe") or "cmd.exe"
+        return [command_prompt, "/d", "/s", "/c", command_line]
+    return command
+
+
 def check_codex_cli() -> None:
-    executable = shutil.which("codex")
-    if executable is None:
-        raise RuntimeError(
-            "Codex CLIが見つかりません。\n\n"
-            "ターミナルで codex --version を確認してください。"
-        )
+    executable = find_codex_cli()
 
     result = subprocess.run(
-        [executable, "--version"],
+        codex_command(executable, "--version"),
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -580,9 +577,7 @@ def check_codex_cli() -> None:
 
 
 def run_codex_polish(input_markdown: str) -> str:
-    executable = shutil.which("codex")
-    if executable is None:
-        raise RuntimeError("Codex CLIが見つかりません。")
+    executable = find_codex_cli()
 
     prompt = build_codex_prompt(input_markdown)
 
@@ -590,8 +585,7 @@ def run_codex_polish(input_markdown: str) -> str:
         temp_dir = Path(temp_name)
         output_path = temp_dir / "codex_result.md"
 
-        command = [
-            executable,
+        arguments = [
             "exec",
             "--ephemeral",
             "--skip-git-repo-check",
@@ -605,6 +599,7 @@ def run_codex_polish(input_markdown: str) -> str:
             str(output_path),
             "-",
         ]
+        command = codex_command(executable, *arguments)
 
         print(f"  英語Markdown全文 {len(prompt):,}文字をCodexへ1回だけ送信します。")
 
@@ -666,10 +661,20 @@ def clean_codex_output(text: str) -> str:
 
 
 def safe_folder_name(name: str, max_length: int = 72) -> str:
-    """PDF名からファイルシステム用の短いフォルダ名を作る。"""
-    cleaned = re.sub(r'[\/:*?"<>|]', '_', name).strip().strip('.')
-    cleaned = re.sub(r'\s+', ' ', cleaned)
-    return (cleaned[:max_length].rstrip() or 'paper')
+    """PDF名からWindowsでも使用できる短いフォルダ名を作る。"""
+    cleaned = re.sub(r'[\x00-\x1f\/:*?"<>|]', "_", name)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    cleaned = cleaned[:max_length].rstrip(" .")
+
+    reserved_names = {
+        "CON", "PRN", "AUX", "NUL",
+        *(f"COM{number}" for number in range(1, 10)),
+        *(f"LPT{number}" for number in range(1, 10)),
+    }
+    if cleaned.split(".", 1)[0].upper() in reserved_names:
+        cleaned = f"_{cleaned}"
+
+    return cleaned or "paper"
 
 
 def create_output_layout(pdf_path: Path) -> tuple[Path, Path]:
@@ -716,11 +721,37 @@ def save_original_text(path: Path, pages: list[str]) -> Path:
 # ============================================================
 
 
-def main() -> int:
-    pdf_path = select_pdf_file()
+def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="英語PDFを抽出し、Codex CLIで日本語Markdownへ変換します。",
+    )
+    parser.add_argument(
+        "pdf",
+        nargs="?",
+        type=Path,
+        help="処理するPDF。省略するとファイル選択画面を表示します。",
+    )
+    parser.add_argument(
+        "--skip-codex",
+        action="store_true",
+        help="Codexによる翻訳を行わず、抽出結果をMarkdownとして保存します。",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_arguments(argv)
+    interactive = args.pdf is None
+    pdf_path = select_pdf_file() if interactive else args.pdf.expanduser().resolve()
     if pdf_path is None:
         print("PDFの選択がキャンセルされました。")
         return 0
+    if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
+        message = f"PDFファイルが見つかりません。\n\n{pdf_path}"
+        print(f"\n[エラー]\n{message}", file=sys.stderr)
+        if interactive:
+            show_error(message)
+        return 1
 
     paper_dir, assets_dir = create_output_layout(pdf_path)
     original_path = paper_dir / "[en]原文抽出.txt"
@@ -733,7 +764,8 @@ def main() -> int:
     print("=" * 60)
 
     try:
-        if not SKIP_CODEX:
+        skip_codex = SKIP_CODEX or args.skip_codex
+        if not skip_codex:
             print("\n1/5 Codex CLIを確認しています。")
             check_codex_cli()
         else:
@@ -756,7 +788,7 @@ def main() -> int:
             images_by_page=images_by_page,
         )
 
-        if SKIP_CODEX:
+        if skip_codex:
             print("\n4/5 Codex処理は設定によりスキップされました。")
             final_text = source_markdown
         else:
@@ -785,7 +817,8 @@ def main() -> int:
     except Exception as exc:
         message = str(exc)
         print(f"\n[エラー]\n{message}", file=sys.stderr)
-        show_error(message)
+        if interactive:
+            show_error(message)
         return 1
 
     paths = [original_path, final_path]
@@ -798,7 +831,8 @@ def main() -> int:
         print(f"- {path}")
     print("=" * 60)
 
-    show_success(paths)
+    if interactive:
+        show_success(paths)
     return 0
 
 
