@@ -36,6 +36,18 @@ MIN_IMAGE_HEIGHT = 100
 MIN_IMAGE_AREA = 30_000
 IMAGE_RENDER_SCALE = 2.0
 
+# 表抽出
+EXTRACT_TABLES = True
+SAVE_TABLE_SOURCE_IMAGES = True
+EMBED_STRUCTURED_TABLE_IMAGES = False
+TABLE_RENDER_SCALE = 3.0
+TABLE_MIN_ROWS = 2
+TABLE_MIN_COLUMNS = 2
+TABLE_CAPTION_TO_RULE_MAX_GAP = 80.0
+TABLE_MAX_HEIGHT = 240.0
+TABLE_RULE_MIN_WIDTH = 60.0
+TABLE_RULE_MAX_GAP = 80.0
+
 # 数式候補判定
 MAX_MATH_CANDIDATE_LENGTH = 500
 HIGH_MATH_CONFIDENCE_SCORE = 5
@@ -58,6 +70,11 @@ MATH_CANDIDATE_MARKER_PATTERN = re.compile(
     r"<!--\s*/?math-candidate\b[^>]*-->\s*",
     flags=re.IGNORECASE,
 )
+TABLE_MARKER_PATTERN = re.compile(
+    r"<!--\s*/?extracted-table\b[^>]*-->\s*",
+    flags=re.IGNORECASE,
+)
+TABLE_NUMBER_PATTERN = re.compile(r"^(?:[IVXLCDM]+|\d+)[.:]?$", flags=re.IGNORECASE)
 
 
 # ============================================================
@@ -80,6 +97,24 @@ class MathCandidate:
     raw_text: str
     confidence: str
     equation_number: str | None
+
+
+@dataclass(frozen=True)
+class ExtractedTable:
+    page_number: int
+    table_index: int
+    caption: str
+    data_bbox: tuple[float, float, float, float]
+    markdown: str
+    relative_obsidian_path: str
+    structured: bool
+
+
+@dataclass(frozen=True)
+class PageElement:
+    y0: float
+    x0: float
+    content: str
 
 
 # ============================================================
@@ -251,9 +286,455 @@ def mark_math_candidate(
     )
 
 
-def remove_math_candidate_markers(text: str) -> str:
-    """数式候補コメントだけを削除し、囲まれた本文は残す。"""
-    return MATH_CANDIDATE_MARKER_PATTERN.sub("", text).strip()
+def remove_extraction_markers(text: str) -> str:
+    """補助コメントだけを削除し、囲まれた本文・表・画像は残す。"""
+    result = MATH_CANDIDATE_MARKER_PATTERN.sub("", text)
+    result = TABLE_MARKER_PATTERN.sub("", result)
+    return result.strip()
+
+
+# ============================================================
+# PDF表抽出
+# ============================================================
+
+
+def rect_overlap_ratio(first: pymupdf.Rect, second: pymupdf.Rect) -> float:
+    """firstの面積に対してsecondと重なる割合を返す。"""
+    intersection = first & second
+    if intersection.is_empty:
+        return 0.0
+
+    first_area = first.width * first.height
+    if first_area <= 0:
+        return 0.0
+
+    return (intersection.width * intersection.height) / first_area
+
+
+def clean_table_cell(value: object) -> str:
+    """PDF表セルをMarkdown表へ安全に入れられる文字列へ整形する。"""
+    if value is None:
+        return ""
+
+    cell = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    cell = re.sub(r"\s*\n\s*", " ", cell)
+    cell = re.sub(r"[ \t]+", " ", cell).strip()
+    return cell.replace("|", r"\|")
+
+
+def normalize_table_rows(rows: list[list[object]]) -> list[list[str]]:
+    """空行を除去し、全行の列数を揃える。"""
+    cleaned = [
+        [clean_table_cell(cell) for cell in row]
+        for row in rows
+        if row is not None
+    ]
+    cleaned = [row for row in cleaned if any(cell for cell in row)]
+    if not cleaned:
+        return []
+
+    column_count = max(len(row) for row in cleaned)
+    return [row + [""] * (column_count - len(row)) for row in cleaned]
+
+
+def rows_to_markdown_table(rows: list[list[object]]) -> str:
+    normalized = normalize_table_rows(rows)
+    if not normalized:
+        return ""
+
+    column_count = len(normalized[0])
+    header = normalized[0]
+    separator = ["---"] * column_count
+
+    lines = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join(separator) + " |",
+    ]
+    lines.extend(
+        "| " + " | ".join(row) + " |"
+        for row in normalized[1:]
+    )
+    return "\n".join(lines)
+
+
+def is_valid_structured_table(rows: list[list[object]]) -> bool:
+    normalized = normalize_table_rows(rows)
+    if len(normalized) < TABLE_MIN_ROWS:
+        return False
+
+    column_count = len(normalized[0]) if normalized else 0
+    if column_count < TABLE_MIN_COLUMNS:
+        return False
+
+    nonempty_count = sum(bool(cell) for row in normalized for cell in row)
+    if nonempty_count < max(4, column_count + 1):
+        return False
+
+    return True
+
+
+def group_page_words_into_lines(page: pymupdf.Page) -> list[tuple[pymupdf.Rect, list[str]]]:
+    """PyMuPDFの単語情報を元のテキスト行単位へまとめる。"""
+    grouped: dict[tuple[int, int], list[tuple]] = {}
+    for word in page.get_text("words", sort=True):
+        key = (int(word[5]), int(word[6]))
+        grouped.setdefault(key, []).append(word)
+
+    result: list[tuple[pymupdf.Rect, list[str]]] = []
+    for words in grouped.values():
+        words = sorted(words, key=lambda item: float(item[0]))
+        if not words:
+            continue
+
+        bbox = pymupdf.Rect(words[0][:4])
+        for word in words[1:]:
+            bbox |= pymupdf.Rect(word[:4])
+
+        result.append((bbox, [str(word[4]) for word in words]))
+
+    return sorted(result, key=lambda item: (item[0].y0, item[0].x0))
+
+
+def find_table_captions(page: pymupdf.Page) -> list[tuple[pymupdf.Rect, str]]:
+    """TABLE I、TABLE 2、表1などの表番号行を座標付きで探す。"""
+    captions: list[tuple[pymupdf.Rect, str]] = []
+
+    for bbox, words in group_page_words_into_lines(page):
+        if len(words) < 2:
+            continue
+
+        first = words[0].strip()
+        second = words[1].strip()
+        is_english_caption = first == "TABLE" and TABLE_NUMBER_PATTERN.match(second)
+        is_japanese_caption = first.startswith("表") and (
+            first != "表" or TABLE_NUMBER_PATTERN.match(second)
+        )
+
+        if is_english_caption or is_japanese_caption:
+            captions.append((bbox, " ".join(words)))
+
+    return captions
+
+
+def find_horizontal_table_rules(page: pymupdf.Page) -> list[pymupdf.Rect]:
+    """罫線として使われていそうな長い水平線を抽出する。"""
+    rules: list[pymupdf.Rect] = []
+
+    for drawing in page.get_drawings():
+        rect = pymupdf.Rect(drawing["rect"])
+        item_count = len(drawing.get("items", []))
+
+        if (
+            rect.width >= TABLE_RULE_MIN_WIDTH
+            and rect.height <= 1.2
+            and item_count <= 3
+        ):
+            rules.append(rect)
+
+    return sorted(rules, key=lambda rect: (rect.y0, rect.x0))
+
+
+def horizontal_overlap_ratio(first: pymupdf.Rect, second: pymupdf.Rect) -> float:
+    overlap = max(0.0, min(first.x1, second.x1) - max(first.x0, second.x0))
+    return overlap / max(1.0, min(first.width, second.width))
+
+
+def find_raster_image_after_caption(
+    page: pymupdf.Page,
+    caption_bbox: pymupdf.Rect,
+    y_limit: float,
+) -> pymupdf.Rect | None:
+    """表がラスター画像の場合、キャプション直下の大きな画像領域を探す。"""
+    candidates: list[pymupdf.Rect] = []
+
+    for info in page.get_image_info(xrefs=True):
+        bbox = pymupdf.Rect(info.get("bbox", (0, 0, 0, 0)))
+        if bbox.is_empty or bbox.is_infinite:
+            continue
+        if bbox.width < 100 or bbox.height < 30:
+            continue
+        if bbox.y0 < caption_bbox.y1 - 2 or bbox.y0 >= y_limit:
+            continue
+        if bbox.y0 - caption_bbox.y1 > TABLE_CAPTION_TO_RULE_MAX_GAP:
+            continue
+        candidates.append(bbox)
+
+    if not candidates:
+        return None
+
+    return min(candidates, key=lambda rect: (rect.y0 - caption_bbox.y1, -rect.width))
+
+
+def detect_caption_table_regions(
+    page: pymupdf.Page,
+) -> list[tuple[str, pymupdf.Rect]]:
+    """
+    表番号と罫線から表本体の領域を推定する。
+
+    find_tables()がセル抽出できない、文字がベクター化された表でも、
+    ページ領域のPNG保存に利用できる。
+    """
+    captions = find_table_captions(page)
+    rules = find_horizontal_table_rules(page)
+    regions: list[tuple[str, pymupdf.Rect]] = []
+
+    for caption_index, (caption_bbox, caption_text) in enumerate(captions):
+        next_caption_y = (
+            captions[caption_index + 1][0].y0
+            if caption_index + 1 < len(captions)
+            else page.rect.height - 10
+        )
+
+        nearby_rules = [
+            rule
+            for rule in rules
+            if caption_bbox.y1 - 1 <= rule.y0
+            <= min(
+                next_caption_y,
+                caption_bbox.y1 + TABLE_CAPTION_TO_RULE_MAX_GAP,
+            )
+        ]
+
+        if nearby_rules:
+            def top_rule_score(rule: pymupdf.Rect) -> tuple[int, float, float]:
+                caption_near_rule = int(
+                    not (
+                        rule.x0 - 20 <= caption_bbox.x0 <= rule.x1 + 20
+                        or rule.x0 - 20 <= caption_bbox.x1 <= rule.x1 + 20
+                    )
+                )
+                return (
+                    caption_near_rule,
+                    rule.y0 - caption_bbox.y1,
+                    -rule.width,
+                )
+
+            top_rule = min(nearby_rules, key=top_rule_score)
+            related_rules = [
+                rule
+                for rule in rules
+                if top_rule.y0 - 1 <= rule.y0 < next_caption_y
+                and rule.y0 <= top_rule.y0 + TABLE_MAX_HEIGHT
+                and horizontal_overlap_ratio(rule, top_rule) >= 0.75
+            ]
+            related_rules.sort(key=lambda rule: rule.y0)
+
+            continuous_rules: list[pymupdf.Rect] = []
+            previous_y: float | None = None
+            for rule in related_rules:
+                if previous_y is not None and rule.y0 - previous_y > TABLE_RULE_MAX_GAP:
+                    break
+                continuous_rules.append(rule)
+                previous_y = rule.y0
+
+            if len(continuous_rules) >= 2:
+                x0 = min(rule.x0 for rule in continuous_rules)
+                x1 = max(rule.x1 for rule in continuous_rules)
+                y0 = top_rule.y0
+                y1 = max(rule.y1 for rule in continuous_rules)
+                regions.append((caption_text, pymupdf.Rect(x0, y0, x1, y1)))
+                continue
+
+        raster_bbox = find_raster_image_after_caption(
+            page,
+            caption_bbox,
+            next_caption_y,
+        )
+        if raster_bbox is not None:
+            regions.append((caption_text, raster_bbox))
+
+    return regions
+
+
+def try_find_structured_table(
+    page: pymupdf.Page,
+    clip: pymupdf.Rect,
+) -> tuple[list[list[object]], pymupdf.Rect] | None:
+    """find_tables()を複数設定で試し、妥当なセル配列だけを採用する。"""
+    strategies = (
+        ("lines", "lines"),
+        ("lines_strict", "lines_strict"),
+        ("text", "lines"),
+        ("text", "lines_strict"),
+    )
+
+    best: tuple[list[list[object]], pymupdf.Rect] | None = None
+    best_nonempty_count = -1
+
+    for vertical_strategy, horizontal_strategy in strategies:
+        try:
+            finder = page.find_tables(
+                clip=clip,
+                vertical_strategy=vertical_strategy,
+                horizontal_strategy=horizontal_strategy,
+                min_words_vertical=2,
+                min_words_horizontal=1,
+                snap_tolerance=4,
+                join_tolerance=4,
+                intersection_tolerance=5,
+                text_tolerance=3,
+            )
+        except Exception:
+            continue
+
+        for table in finder.tables:
+            rows = table.extract()
+            if not is_valid_structured_table(rows):
+                continue
+
+            normalized = normalize_table_rows(rows)
+            nonempty_count = sum(bool(cell) for row in normalized for cell in row)
+            if nonempty_count <= best_nonempty_count:
+                continue
+
+            best_nonempty_count = nonempty_count
+            best = (rows, pymupdf.Rect(table.bbox))
+
+    return best
+
+
+def render_table_source_image(
+    page: pymupdf.Page,
+    table_bbox: pymupdf.Rect,
+    output_path: Path,
+) -> None:
+    """表のページ領域を見た目どおりPNGへレンダリングする。"""
+    padding = 3.0
+    clip = pymupdf.Rect(
+        max(page.rect.x0, table_bbox.x0 - padding),
+        max(page.rect.y0, table_bbox.y0 - padding),
+        min(page.rect.x1, table_bbox.x1 + padding),
+        min(page.rect.y1, table_bbox.y1 + padding),
+    )
+
+    pixmap = page.get_pixmap(
+        matrix=pymupdf.Matrix(TABLE_RENDER_SCALE, TABLE_RENDER_SCALE),
+        clip=clip,
+        alpha=False,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(pixmap.tobytes("png"))
+
+
+def table_regions_overlap(first: pymupdf.Rect, second: pymupdf.Rect) -> bool:
+    return (
+        rect_overlap_ratio(first, second) >= 0.5
+        or rect_overlap_ratio(second, first) >= 0.5
+    )
+
+
+def extract_tables_from_page(
+    page: pymupdf.Page,
+    page_number: int,
+    tables_dir: Path,
+) -> list[ExtractedTable]:
+    """構造化表を優先し、失敗時は表領域の画像を必ず残す。"""
+    if not EXTRACT_TABLES:
+        return []
+
+    regions = detect_caption_table_regions(page)
+    extracted: list[ExtractedTable] = []
+
+    for table_index, (caption, detected_bbox) in enumerate(regions, start=1):
+        expanded_clip = pymupdf.Rect(
+            max(page.rect.x0, detected_bbox.x0 - 5),
+            max(page.rect.y0, detected_bbox.y0 - 5),
+            min(page.rect.x1, detected_bbox.x1 + 5),
+            min(page.rect.y1, detected_bbox.y1 + 5),
+        )
+
+        structured_result = try_find_structured_table(page, expanded_clip)
+        if structured_result is not None:
+            rows, structured_bbox = structured_result
+            markdown = rows_to_markdown_table(rows)
+            table_bbox = structured_bbox
+            structured = True
+        else:
+            markdown = ""
+            table_bbox = detected_bbox
+            structured = False
+
+        filename = f"page_{page_number:03d}_table_{table_index:02d}.png"
+        relative_path = f"assets/tables/{filename}"
+        output_path = tables_dir / filename
+
+        if SAVE_TABLE_SOURCE_IMAGES or not structured:
+            render_table_source_image(page, table_bbox, output_path)
+
+        extracted.append(
+            ExtractedTable(
+                page_number=page_number,
+                table_index=table_index,
+                caption=caption,
+                data_bbox=tuple(float(value) for value in table_bbox),
+                markdown=markdown,
+                relative_obsidian_path=relative_path,
+                structured=structured,
+            )
+        )
+
+    return extracted
+
+
+def extract_pdf_tables(
+    pdf_path: Path,
+    assets_dir: Path,
+) -> dict[int, list[ExtractedTable]]:
+    """PDF全ページから表を抽出し、元表画像をassets/tablesへ保存する。"""
+    by_page: dict[int, list[ExtractedTable]] = {}
+    if not EXTRACT_TABLES:
+        return by_page
+
+    tables_dir = assets_dir / "tables"
+
+    with pymupdf.open(pdf_path) as document:
+        for page_number, page in enumerate(document, start=1):
+            tables = extract_tables_from_page(page, page_number, tables_dir)
+            if tables:
+                by_page[page_number] = tables
+
+            structured_count = sum(table.structured for table in tables)
+            fallback_count = len(tables) - structured_count
+            print(
+                f"[表抽出] {page_number}/{document.page_count}ページ: "
+                f"{len(tables)}個 "
+                f"(Markdown={structured_count}, 画像={fallback_count})"
+            )
+
+    if not any(by_page.values()):
+        try:
+            tables_dir.rmdir()
+        except OSError:
+            pass
+
+    return by_page
+
+
+def table_to_raw_content(table: ExtractedTable) -> str:
+    if table.structured and table.markdown:
+        return table.markdown
+    return f"[TABLE IMAGE: {table.relative_obsidian_path}]"
+
+
+def table_to_codex_content(table: ExtractedTable) -> str:
+    structured_value = "true" if table.structured else "false"
+    marker = (
+        f'<!-- extracted-table page="{table.page_number}" '
+        f'index="{table.table_index}" structured="{structured_value}" '
+        f'source-image="{table.relative_obsidian_path}" -->'
+    )
+
+    contents: list[str] = [marker]
+
+    if table.structured and table.markdown:
+        contents.append(table.markdown)
+        if EMBED_STRUCTURED_TABLE_IMAGES and table.relative_obsidian_path:
+            contents.append(f"![[{table.relative_obsidian_path}]]")
+    else:
+        contents.append(f"![[{table.relative_obsidian_path}]]")
+
+    contents.append("<!-- /extracted-table -->")
+    return "\n".join(contents)
 
 
 # ============================================================
@@ -267,8 +748,6 @@ def normalize_text_block(text: str) -> str:
         return ""
 
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    # trans-\nlation のような行末ハイフンを結合する。
     text = re.sub(r"(?<=[A-Za-z])-\s*\n\s*(?=[A-Za-z])", "", text)
 
     lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
@@ -277,7 +756,6 @@ def normalize_text_block(text: str) -> str:
     if not lines:
         return ""
 
-    # 数式らしい短い行だけで構成されるブロックは改行を維持する。
     if all(is_math_like_line(line) for line in lines):
         return "\n".join(lines)
 
@@ -287,24 +765,14 @@ def normalize_text_block(text: str) -> str:
 def extract_text_from_blocks(
     page: pymupdf.Page,
     page_number: int,
+    tables: list[ExtractedTable],
 ) -> tuple[str, str, list[MathCandidate]]:
-    """
-    PDFブロック境界を残して文字を抽出する。
-
-    raw_text:
-        [en]原文抽出.txtへ保存する、補助コメントなしの文字列。
-
-    codex_text:
-        数式候補コメントを付けたCodex入力用文字列。
-    """
+    """本文と表を座標順にまとめ、保存用・Codex用の2種類を返す。"""
     blocks = page.get_text("blocks")
-    blocks = sorted(
-        blocks,
-        key=lambda block: (round(block[1], 1), round(block[0], 1)),
-    )
+    table_rects = [pymupdf.Rect(table.data_bbox) for table in tables]
 
-    raw_parts: list[str] = []
-    codex_parts: list[str] = []
+    raw_elements: list[PageElement] = []
+    codex_elements: list[PageElement] = []
     candidates: list[MathCandidate] = []
 
     for block_index, block in enumerate(blocks, start=1):
@@ -312,45 +780,80 @@ def extract_text_from_blocks(
         if block_type != 0:
             continue
 
+        block_rect = pymupdf.Rect(block[0], block[1], block[2], block[3])
+        if any(rect_overlap_ratio(block_rect, table_rect) >= 0.5 for table_rect in table_rects):
+            continue
+
         normalized = normalize_text_block(str(block[4]))
         if not normalized:
             continue
 
-        raw_parts.append(normalized)
+        raw_elements.append(
+            PageElement(
+                y0=float(block_rect.y0),
+                x0=float(block_rect.x0),
+                content=normalized,
+            )
+        )
 
         confidence, equation_number = classify_math_block(normalized)
         if confidence is None:
-            codex_parts.append(normalized)
-            continue
-
-        candidate = MathCandidate(
-            page_number=page_number,
-            block_index=block_index,
-            raw_text=normalized,
-            confidence=confidence,
-            equation_number=equation_number,
-        )
-        candidates.append(candidate)
-
-        codex_parts.append(
-            mark_math_candidate(
+            codex_content = normalized
+        else:
+            candidate = MathCandidate(
+                page_number=page_number,
+                block_index=block_index,
+                raw_text=normalized,
+                confidence=confidence,
+                equation_number=equation_number,
+            )
+            candidates.append(candidate)
+            codex_content = mark_math_candidate(
                 text=normalized,
                 page_number=page_number,
                 block_index=block_index,
                 confidence=confidence,
                 equation_number=equation_number,
             )
+
+        codex_elements.append(
+            PageElement(
+                y0=float(block_rect.y0),
+                x0=float(block_rect.x0),
+                content=codex_content,
+            )
         )
 
+    for table in tables:
+        table_rect = pymupdf.Rect(table.data_bbox)
+        raw_elements.append(
+            PageElement(
+                y0=float(table_rect.y0),
+                x0=float(table_rect.x0),
+                content=table_to_raw_content(table),
+            )
+        )
+        codex_elements.append(
+            PageElement(
+                y0=float(table_rect.y0),
+                x0=float(table_rect.x0),
+                content=table_to_codex_content(table),
+            )
+        )
+
+    raw_elements.sort(key=lambda element: (round(element.y0, 1), round(element.x0, 1)))
+    codex_elements.sort(key=lambda element: (round(element.y0, 1), round(element.x0, 1)))
+
     return (
-        "\n\n".join(raw_parts),
-        "\n\n".join(codex_parts),
+        "\n\n".join(element.content for element in raw_elements),
+        "\n\n".join(element.content for element in codex_elements),
         candidates,
     )
 
 
 def extract_pdf_text(
     pdf_path: Path,
+    tables_by_page: dict[int, list[ExtractedTable]],
 ) -> tuple[list[str], list[str], list[MathCandidate]]:
     """保存用原文、Codex用原文、数式候補一覧をページ単位で取得する。"""
     raw_pages: list[str] = []
@@ -364,6 +867,7 @@ def extract_pdf_text(
             raw_text, codex_text, candidates = extract_text_from_blocks(
                 page,
                 page_number,
+                tables_by_page.get(page_number, []),
             )
 
             method = "直接抽出" if raw_text else "抽出結果なし"
@@ -385,12 +889,12 @@ def extract_pdf_text(
 def extract_pdf_images(
     pdf_path: Path,
     assets_dir: Path,
+    tables_by_page: dict[int, list[ExtractedTable]],
 ) -> dict[int, list[ExtractedImage]]:
     """
     PDF内のラスター画像をPNGとして抽出する。
 
-    Obsidianから参照しやすいよう、Markdownと同じ階層にassetsフォルダを作る。
-    小さなロゴ・アイコン・マスク画像は寸法で除外する。
+    表として抽出済みの領域と重なる画像は、図としての重複保存を避ける。
     """
     by_page: dict[int, list[ExtractedImage]] = {}
     if not EXTRACT_IMAGES:
@@ -403,6 +907,10 @@ def extract_pdf_images(
         for page_number, page in enumerate(document, start=1):
             page_items: list[ExtractedImage] = []
             image_infos = page.get_image_info(xrefs=True)
+            table_rects = [
+                pymupdf.Rect(table.data_bbox)
+                for table in tables_by_page.get(page_number, [])
+            ]
 
             for image_index, info in enumerate(image_infos, start=1):
                 bbox = pymupdf.Rect(info.get("bbox", (0, 0, 0, 0)))
@@ -415,6 +923,12 @@ def extract_pdf_images(
                     or width * height < MIN_IMAGE_AREA
                     or bbox.is_empty
                     or bbox.is_infinite
+                ):
+                    continue
+
+                if any(
+                    rect_overlap_ratio(bbox, table_rect) >= 0.6
+                    for table_rect in table_rects
                 ):
                     continue
 
@@ -451,7 +965,7 @@ def extract_pdf_images(
                 f"{len(by_page.get(page_number, []))}枚"
             )
 
-    if not any(by_page.values()):
+    if not any(by_page.values()) and not any(tables_by_page.values()):
         try:
             assets_dir.rmdir()
         except OSError:
@@ -516,7 +1030,7 @@ def build_source_markdown(
         "# Extracted English Source",
         "",
         "> This text was automatically extracted from the PDF.",
-        "> Reading order, equations, headings, tables, and line breaks may be broken.",
+        "> Reading order, equations, headings, and line breaks may be broken. Tables may be structured Markdown or source-image fallbacks.",
         "",
     ]
 
@@ -785,6 +1299,81 @@ def inspect_math_output(
 
 
 # ============================================================
+# Codex出力の表検査
+# ============================================================
+
+
+def extract_markdown_tables(text: str) -> list[list[str]]:
+    tables: list[list[str]] = []
+    current: list[str] = []
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("|") and stripped.endswith("|"):
+            current.append(stripped)
+            continue
+
+        if len(current) >= 2 and re.match(r"^\|(?:\s*:?-+:?\s*\|)+$", current[1]):
+            tables.append(current)
+        current = []
+
+    if len(current) >= 2 and re.match(r"^\|(?:\s*:?-+:?\s*\|)+$", current[1]):
+        tables.append(current)
+
+    return tables
+
+
+def extract_numeric_tokens(text: str) -> Counter[str]:
+    values = re.findall(
+        r"(?<![A-Za-z])\d+(?:,\d{3})*(?:\.\d+)?(?:%|ms|MB|GB|kB|m²)?",
+        text,
+    )
+    return Counter(values)
+
+
+def inspect_table_output(
+    tables_by_page: dict[int, list[ExtractedTable]],
+    output_markdown: str,
+) -> list[str]:
+    """表の欠落を検査する。問題があっても翻訳結果は採用する。"""
+    warnings: list[str] = []
+    tables = [table for page_tables in tables_by_page.values() for table in page_tables]
+    structured_tables = [table for table in tables if table.structured and table.markdown]
+    image_tables = [table for table in tables if not table.structured]
+
+    markdown_tables = extract_markdown_tables(output_markdown)
+    if structured_tables and len(markdown_tables) < len(structured_tables):
+        warnings.append(
+            f"構造化表{len(structured_tables)}個に対し、出力のMarkdown表は"
+            f"{len(markdown_tables)}個でした。"
+        )
+
+    missing_images = [
+        table.relative_obsidian_path
+        for table in image_tables
+        if table.relative_obsidian_path not in output_markdown
+    ]
+    if missing_images:
+        preview = ", ".join(missing_images[:5])
+        suffix = " ..." if len(missing_images) > 5 else ""
+        warnings.append(f"表の元画像リンクが出力から欠落しています: {preview}{suffix}")
+
+    if structured_tables:
+        source_numbers = Counter()
+        for table in structured_tables:
+            source_numbers.update(extract_numeric_tokens(table.markdown))
+
+        output_numbers = extract_numeric_tokens(output_markdown)
+        missing_numbers = list((source_numbers - output_numbers).elements())
+        if missing_numbers:
+            preview = ", ".join(missing_numbers[:15])
+            suffix = " ..." if len(missing_numbers) > 15 else ""
+            warnings.append(f"原表にある数値が出力で確認できません: {preview}{suffix}")
+
+    return warnings
+
+
+# ============================================================
 # 出力先・リンク
 # ============================================================
 
@@ -903,8 +1492,12 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print("\n1/5 Codex CLI確認をスキップします。")
 
-        print("\n2/5 PDFから文章を取得しています。")
-        original_pages, codex_pages, math_candidates = extract_pdf_text(pdf_path)
+        print("\n2/5 PDFから表と文章を取得しています。")
+        tables_by_page = extract_pdf_tables(pdf_path, assets_dir)
+        original_pages, codex_pages, math_candidates = extract_pdf_text(
+            pdf_path,
+            tables_by_page,
+        )
 
         if not any(text.strip() for text in original_pages):
             raise RuntimeError("PDFから文章を取得できませんでした。")
@@ -921,10 +1514,26 @@ def main(argv: list[str] | None = None) -> int:
             f"(high={high_count}, medium={medium_count})"
         )
 
+        table_count = sum(len(items) for items in tables_by_page.values())
+        structured_table_count = sum(
+            table.structured
+            for items in tables_by_page.values()
+            for table in items
+        )
+        print(
+            f"  抽出した表: {table_count}個 "
+            f"(Markdown={structured_table_count}, "
+            f"画像={table_count - structured_table_count})"
+        )
+
         print("\n3/5 PDF画像を抽出しています。")
-        images_by_page = extract_pdf_images(pdf_path, assets_dir)
+        images_by_page = extract_pdf_images(
+            pdf_path,
+            assets_dir,
+            tables_by_page,
+        )
         image_count = sum(len(items) for items in images_by_page.values())
-        print(f"  抽出した画像: {image_count}枚")
+        print(f"  抽出した図・写真: {image_count}枚")
 
         source_markdown = build_source_markdown(
             pdf_link_line=pdf_link_line,
@@ -934,7 +1543,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if skip_codex:
             print("\n4/5 Codex処理は設定によりスキップされました。")
-            final_text = remove_math_candidate_markers(source_markdown)
+            final_text = remove_extraction_markers(source_markdown)
         else:
             print("\n4/5 Codex CLIで英語原文を日本語へ直接翻訳・整形しています。")
             print(f"  使用モデル: {CODEX_MODEL}")
@@ -950,7 +1559,7 @@ def main(argv: list[str] | None = None) -> int:
                 if not candidate.strip():
                     raise RuntimeError("Codexの出力が空でした。")
 
-                final_text = remove_math_candidate_markers(candidate)
+                final_text = remove_extraction_markers(candidate)
 
                 math_warnings = inspect_math_output(math_candidates, final_text)
                 if math_warnings:
@@ -958,10 +1567,16 @@ def main(argv: list[str] | None = None) -> int:
                     for warning in math_warnings:
                         print(f"    - {warning}")
 
+                table_warnings = inspect_table_output(tables_by_page, final_text)
+                if table_warnings:
+                    print("  [表確認]")
+                    for warning in table_warnings:
+                        print(f"    - {warning}")
+
                 print("  Codex翻訳版を最終結果として採用します。")
             except Exception as exc:
                 # 翻訳が失敗しても抽出内容を失わない。
-                final_text = remove_math_candidate_markers(source_markdown)
+                final_text = remove_extraction_markers(source_markdown)
                 print(
                     "  [警告] Codex処理に失敗したため英語抽出版を保存します: "
                     f"{exc}"
