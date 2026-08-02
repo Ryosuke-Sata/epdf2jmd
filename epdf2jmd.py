@@ -8,12 +8,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import tkinter as tk
-from urllib.parse import quote
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox
+from urllib.parse import quote
 
 import pymupdf
 
@@ -22,31 +22,12 @@ import pymupdf
 # 設定
 # ============================================================
 
-SOURCE_LANGUAGE = "en"
-TARGET_LANGUAGE = "ja"
-
 # Codex CLI
 CODEX_MODEL = "gpt-5.6-luna"
 CODEX_REASONING_EFFORT = "low"
 CODEX_TIMEOUT_SECONDS = 1800
 SKIP_CODEX = False
 PROMPT_FILENAME = "prompt.md"
-
-# Codex出力の簡易検査
-MIN_OUTPUT_LENGTH_RATIO = 0.65
-INVALID_OUTPUT_PATTERNS = (
-    "okay, let's",
-    "let's tackle",
-    "i need to",
-    "the user wants",
-    "first, i'll",
-    "let me analyze",
-    "let me think",
-    "editing task",
-    "作業方針:",
-    "入力を確認します",
-    "編集タスク:",
-)
 
 # 画像抽出
 EXTRACT_IMAGES = True
@@ -55,9 +36,28 @@ MIN_IMAGE_HEIGHT = 100
 MIN_IMAGE_AREA = 30_000
 IMAGE_RENDER_SCALE = 2.0
 
-# 数式プレースホルダー
-MATH_TOKEN_PREFIX = "ZXQMATH"
-MATH_TOKEN_SUFFIX = "QXZ"
+# 数式候補判定
+MAX_MATH_CANDIDATE_LENGTH = 500
+HIGH_MATH_CONFIDENCE_SCORE = 5
+MEDIUM_MATH_CONFIDENCE_SCORE = 2
+
+MATH_OPERATOR_PATTERN = re.compile(
+    r"[=<>≤≥≠∈∉⊂⊆⊃⊇∪∩∑∏√∞≈±×÷→←↔∅]"
+)
+GREEK_OR_LATEX_PATTERN = re.compile(
+    r"[Α-Ωα-ω]|"
+    r"\\(?:frac|dfrac|tfrac|sum|prod|int|sqrt|argmin|argmax|"
+    r"mathrm|mathbf|mathbb|mathcal|left|right|begin|end|"
+    r"cup|cap|subset|in|cdot|times|theta|alpha|beta|gamma|lambda|sigma)"
+)
+EQUATION_NUMBER_PATTERN = re.compile(
+    r"(?:\(|\[)(\d{1,3})(?:\)|\])\s*[.,;:]?\s*$"
+)
+REFERENCE_ENTRY_PATTERN = re.compile(r"^\s*\[\d+\]\s+")
+MATH_CANDIDATE_MARKER_PATTERN = re.compile(
+    r"<!--\s*/?math-candidate\b[^>]*-->\s*",
+    flags=re.IGNORECASE,
+)
 
 
 # ============================================================
@@ -71,6 +71,15 @@ class ExtractedImage:
     filename: str
     relative_obsidian_path: str
     y0: float
+
+
+@dataclass(frozen=True)
+class MathCandidate:
+    page_number: int
+    block_index: int
+    raw_text: str
+    confidence: str
+    equation_number: str | None
 
 
 # ============================================================
@@ -101,17 +110,150 @@ def select_pdf_file() -> Path | None:
 
 def show_error(message: str) -> None:
     root = tk.Tk()
-    root.withdraw()
-    messagebox.showerror("エラー", message)
-    root.destroy()
+    try:
+        root.withdraw()
+        messagebox.showerror("エラー", message)
+    finally:
+        root.destroy()
 
 
 def show_success(paths: list[Path]) -> None:
     root = tk.Tk()
-    root.withdraw()
-    saved = "\n".join(str(path) for path in paths)
-    messagebox.showinfo("処理完了", f"処理が完了しました。\n\n保存先:\n{saved}")
-    root.destroy()
+    try:
+        root.withdraw()
+        saved = "\n".join(str(path) for path in paths)
+        messagebox.showinfo("処理完了", f"処理が完了しました。\n\n保存先:\n{saved}")
+    finally:
+        root.destroy()
+
+
+# ============================================================
+# 数式候補の判定・マーカー
+# ============================================================
+
+
+def is_balanced_math_candidate(value: str) -> bool:
+    """括弧の個数だけを確認する簡易検査。数学的な正しさは判定しない。"""
+    pairs = (("(", ")"), ("[", "]"), ("{", "}"))
+    return all(value.count(opening) == value.count(closing) for opening, closing in pairs)
+
+
+def is_math_like_line(line: str) -> bool:
+    """改行を残した方がよい短い数式行かを保守的に判定する。"""
+    stripped = line.strip()
+    if not stripped or len(stripped) > 260:
+        return False
+
+    if re.search(r"(?:https?://|www\.|doi\b|arxiv\b)", stripped, flags=re.IGNORECASE):
+        return False
+
+    if REFERENCE_ENTRY_PATTERN.match(stripped):
+        return False
+
+    operator_count = len(MATH_OPERATOR_PATTERN.findall(stripped))
+    has_math_command = bool(GREEK_OR_LATEX_PATTERN.search(stripped))
+    has_sub_or_superscript = bool(re.search(r"[_^]", stripped))
+    long_words = re.findall(r"\b[A-Za-z]{5,}\b", stripped)
+
+    if len(long_words) > 8:
+        return False
+
+    return operator_count >= 1 or has_math_command or has_sub_or_superscript
+
+
+def classify_math_block(text: str) -> tuple[str | None, str | None]:
+    """
+    PDFテキストブロックの数式らしさを high / medium / None で返す。
+
+    この判定は数式を置換・削除するためには使わず、Codexへの補助コメントを
+    付けるためだけに使う。誤判定しても元の文字列は必ず残る。
+    """
+    value = text.strip()
+    if not value:
+        return None, None
+
+    equation_match = EQUATION_NUMBER_PATTERN.search(value)
+    equation_number = equation_match.group(1) if equation_match else None
+
+    if len(value) > MAX_MATH_CANDIDATE_LENGTH:
+        return None, equation_number
+
+    if re.search(r"(?:https?://|www\.|doi\b|arxiv\b)", value, flags=re.IGNORECASE):
+        return None, equation_number
+
+    if REFERENCE_ENTRY_PATTERN.match(value):
+        return None, equation_number
+
+    score = 0
+
+    if equation_number is not None:
+        score += 3
+
+    operator_count = len(MATH_OPERATOR_PATTERN.findall(value))
+    if operator_count >= 2:
+        score += 2
+    elif operator_count == 1:
+        score += 1
+
+    if GREEK_OR_LATEX_PATTERN.search(value):
+        score += 2
+
+    if re.search(r"[_^]", value):
+        score += 1
+
+    if re.search(r"[A-Za-z]\s*[\(\[]|[\)\]]\s*[A-Za-z]", value):
+        score += 1
+
+    if len(value) <= 240:
+        score += 1
+
+    long_words = re.findall(r"\b[A-Za-z]{5,}\b", value)
+    if len(long_words) >= 10:
+        score -= 3
+    elif len(long_words) >= 6:
+        score -= 1
+
+    # 括弧不一致は壊れた数式の可能性があるため除外せず、信頼度だけ下げる。
+    if not is_balanced_math_candidate(value):
+        score -= 1
+
+    if score >= HIGH_MATH_CONFIDENCE_SCORE:
+        return "high", equation_number
+
+    if score >= MEDIUM_MATH_CONFIDENCE_SCORE:
+        return "medium", equation_number
+
+    return None, equation_number
+
+
+def mark_math_candidate(
+    text: str,
+    page_number: int,
+    block_index: int,
+    confidence: str,
+    equation_number: str | None,
+) -> str:
+    """元の文字列を残したまま、Codex向けの数式候補コメントで囲む。"""
+    attributes = [
+        f'page="{page_number}"',
+        f'block="{block_index}"',
+        f'confidence="{confidence}"',
+    ]
+
+    if equation_number is not None:
+        attributes.append(f'equation-number="{equation_number}"')
+
+    attribute_text = " ".join(attributes)
+    return (
+        f"<!-- math-candidate {attribute_text} -->\n"
+        f"{text}\n"
+        f"<!-- /math-candidate -->"
+    )
+
+
+def remove_math_candidate_markers(text: str) -> str:
+    """数式候補コメントだけを削除し、囲まれた本文は残す。"""
+    return MATH_CANDIDATE_MARKER_PATTERN.sub("", text).strip()
 
 
 # ============================================================
@@ -135,203 +277,104 @@ def normalize_text_block(text: str) -> str:
     if not lines:
         return ""
 
-    # 数式らしい短い行は改行を維持する。
+    # 数式らしい短い行だけで構成されるブロックは改行を維持する。
     if all(is_math_like_line(line) for line in lines):
         return "\n".join(lines)
 
     return " ".join(lines).strip()
 
 
-def extract_text_from_blocks(page: pymupdf.Page) -> str:
-    """PDFブロック境界を残してテキストを直接抽出する。"""
-    blocks = page.get_text("blocks")
-    blocks = sorted(blocks, key=lambda block: (round(block[1], 1), round(block[0], 1)))
+def extract_text_from_blocks(
+    page: pymupdf.Page,
+    page_number: int,
+) -> tuple[str, str, list[MathCandidate]]:
+    """
+    PDFブロック境界を残して文字を抽出する。
 
-    parts: list[str] = []
-    for block in blocks:
+    raw_text:
+        [en]原文抽出.txtへ保存する、補助コメントなしの文字列。
+
+    codex_text:
+        数式候補コメントを付けたCodex入力用文字列。
+    """
+    blocks = page.get_text("blocks")
+    blocks = sorted(
+        blocks,
+        key=lambda block: (round(block[1], 1), round(block[0], 1)),
+    )
+
+    raw_parts: list[str] = []
+    codex_parts: list[str] = []
+    candidates: list[MathCandidate] = []
+
+    for block_index, block in enumerate(blocks, start=1):
         block_type = int(block[6]) if len(block) > 6 else 0
         if block_type != 0:
             continue
 
         normalized = normalize_text_block(str(block[4]))
-        if normalized:
-            parts.append(normalized)
-
-    return "\n\n".join(parts)
-
-
-def extract_page_text(page: pymupdf.Page) -> tuple[str, str]:
-    direct_text = extract_text_from_blocks(page)
-    return (direct_text, "直接抽出") if direct_text else ("", "抽出結果なし")
-
-
-def extract_pdf_text(pdf_path: Path) -> list[str]:
-    page_texts: list[str] = []
-
-    with pymupdf.open(pdf_path) as document:
-        for index, page in enumerate(document, start=1):
-            print(f"[文字抽出] {index}/{document.page_count}ページ")
-            text, method = extract_page_text(page)
-            print(f"  -> {method}: {len(text)}文字")
-            page_texts.append(text)
-
-    return page_texts
-
-
-# ============================================================
-# 数式の退避・復元
-# ============================================================
-
-
-def math_token(index: int) -> str:
-    return f"{MATH_TOKEN_PREFIX}{index:06d}{MATH_TOKEN_SUFFIX}"
-
-
-def is_balanced_math_candidate(value: str) -> bool:
-    """途中で切れた数式断片を退避しないための簡易検査。"""
-    pairs = (("(", ")"), ("[", "]"), ("{", "}"))
-    for opening, closing in pairs:
-        if value.count(opening) != value.count(closing):
-            return False
-
-    if re.search(r"(?:https?://|www\.|doi\b|arxiv\b|\bid\s*=)", value, flags=re.IGNORECASE):
-        return False
-    if re.search(r"[=,+\-*/∪∩]\s*$", value):
-        return False
-    if re.match(r"^\s*[=,+*/∪∩]", value):
-        return False
-
-    if "=" in value:
-        left, right = value.split("=", 1)
-        if not left.strip() or len(right.strip()) < 2:
-            return False
-
-    return True
-
-
-def is_math_like_line(line: str) -> bool:
-    """短い行が、完結した数式らしいかを保守的に判定する。"""
-    stripped = line.strip()
-    if not stripped or len(stripped) > 260 or not is_balanced_math_candidate(stripped):
-        return False
-
-    if re.search(r"[=<>≤≥≠∈∉⊂⊆⊃⊇∪∩∑∏√∞≈±×÷→←↔∅εαβγδθλμσφω]", stripped):
-        words = re.findall(r"[A-Za-z]{4,}", stripped)
-        math_marks = re.findall(r"[_^{}()\[\]|,+\-*/=<>≤≥≠∈⊂⊆∪∩]", stripped)
-        return len(math_marks) >= 1 and len(words) <= 8
-
-    if re.search(r"\\(?:frac|sum|prod|arg|min|max|mathrm|mathbb|left|right|cup|cap|subset|in|cdot|quad)", stripped):
-        return True
-
-    return False
-
-
-def normalize_math_for_markdown(raw: str, display: bool) -> str:
-    """元の数式内容を変更せずMarkdown数式区切りだけ統一する。"""
-    value = raw.strip()
-
-    wrappers = (
-        (r"^\$\$(.*)\$\$$", True),
-        (r"^\\\[(.*)\\\]$", True),
-        (r"^\$(.*)\$$", False),
-        (r"^\\\((.*)\\\)$", False),
-    )
-    for pattern, wrapped_display in wrappers:
-        match = re.match(pattern, value, flags=re.DOTALL)
-        if match:
-            value = match.group(1).strip()
-            display = wrapped_display
-            break
-
-    if display:
-        return f"$$\n{value}\n$$"
-    return f"${value}$"
-
-
-def protect_math_expressions(text: str, math_store: dict[str, str]) -> str:
-    """
-    数式をプレースホルダーへ置換する。
-
-    既存のLaTeX区切りを最優先で保護し、その後、独立した数式らしい
-    ブロックと、等号・包含記号などを含む短い行内式を保護する。
-    """
-
-    def save(raw: str, display: bool) -> str:
-        token = math_token(len(math_store) + 1)
-        math_store[token] = normalize_math_for_markdown(raw, display)
-        return token
-
-    protected = text
-
-    # 既に区切られている数式。
-    patterns = (
-        (r"\$\$(.+?)\$\$", True),
-        (r"\\\[(.+?)\\\]", True),
-        (r"(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)", False),
-        (r"\\\((.+?)\\\)", False),
-    )
-
-    for pattern, display in patterns:
-        protected = re.sub(
-            pattern,
-            lambda match, d=display: save(match.group(0), d),
-            protected,
-            flags=re.DOTALL,
-        )
-
-    # ブロック単位の数式候補。
-    blocks = re.split(r"(\n\s*\n)", protected)
-    for index in range(0, len(blocks), 2):
-        block = blocks[index].strip()
-        if not block or MATH_TOKEN_PREFIX in block:
+        if not normalized:
             continue
 
-        block_lines = [line.strip() for line in block.splitlines() if line.strip()]
-        if block_lines and all(is_math_like_line(line) for line in block_lines):
-            blocks[index] = save("\n".join(block_lines), True)
+        raw_parts.append(normalized)
 
-    protected = "".join(blocks)
+        confidence, equation_number = classify_math_block(normalized)
+        if confidence is None:
+            codex_parts.append(normalized)
+            continue
 
-    # 行内の短い数式候補。英語文章全体を巻き込まないよう、長さを制限する。
-    inline_pattern = re.compile(
-        r"(?<![A-Za-z0-9_])"
-        r"([A-Za-z][A-Za-z0-9_{}^\\]*"
-        r"(?:\s*[=<>≤≥≠∈⊂⊆]\s*)"
-        r"[A-Za-z0-9_{}^\\()\[\].,+\-*/| ∪∩]+?)"
-        r"(?=[,;:。．、]|\s(?:and|or|where|is|are|was|were)\b|$)",
-        flags=re.MULTILINE,
+        candidate = MathCandidate(
+            page_number=page_number,
+            block_index=block_index,
+            raw_text=normalized,
+            confidence=confidence,
+            equation_number=equation_number,
+        )
+        candidates.append(candidate)
+
+        codex_parts.append(
+            mark_math_candidate(
+                text=normalized,
+                page_number=page_number,
+                block_index=block_index,
+                confidence=confidence,
+                equation_number=equation_number,
+            )
+        )
+
+    return (
+        "\n\n".join(raw_parts),
+        "\n\n".join(codex_parts),
+        candidates,
     )
 
-    def replace_inline(match: re.Match[str]) -> str:
-        candidate = match.group(1).strip()
-        if not is_balanced_math_candidate(candidate):
-            return match.group(0)
-        return save(candidate, False)
 
-    protected = inline_pattern.sub(replace_inline, protected)
+def extract_pdf_text(
+    pdf_path: Path,
+) -> tuple[list[str], list[str], list[MathCandidate]]:
+    """保存用原文、Codex用原文、数式候補一覧をページ単位で取得する。"""
+    raw_pages: list[str] = []
+    codex_pages: list[str] = []
+    all_candidates: list[MathCandidate] = []
 
-    return protected
+    with pymupdf.open(pdf_path) as document:
+        for page_number, page in enumerate(document, start=1):
+            print(f"[文字抽出] {page_number}/{document.page_count}ページ")
 
+            raw_text, codex_text, candidates = extract_text_from_blocks(
+                page,
+                page_number,
+            )
 
-def protect_math_pages(page_texts: list[str]) -> tuple[list[str], dict[str, str]]:
-    math_store: dict[str, str] = {}
-    protected_pages = [protect_math_expressions(text, math_store) for text in page_texts]
-    return protected_pages, math_store
+            method = "直接抽出" if raw_text else "抽出結果なし"
+            print(f"  -> {method}: {len(raw_text)}文字")
+            print(f"  -> 数式候補: {len(candidates)}件")
 
+            raw_pages.append(raw_text)
+            codex_pages.append(codex_text)
+            all_candidates.extend(candidates)
 
-def restore_math_placeholders(text: str, math_store: dict[str, str]) -> str:
-    result = text
-    for token, math_text in math_store.items():
-        result = result.replace(token, math_text)
-    return result
-
-
-def validate_math_placeholders(text: str, math_store: dict[str, str]) -> tuple[bool, str]:
-    missing = [token for token in math_store if text.count(token) != 1]
-    if missing:
-        preview = ", ".join(missing[:8])
-        return False, f"数式プレースホルダーが欠落・重複しています: {preview}"
-    return True, ""
+    return raw_pages, codex_pages, all_candidates
 
 
 # ============================================================
@@ -375,7 +418,6 @@ def extract_pdf_images(
                 ):
                     continue
 
-                # ページ上の表示領域をレンダリングすることで、マスク付き画像にも対応する。
                 matrix = pymupdf.Matrix(IMAGE_RENDER_SCALE, IMAGE_RENDER_SCALE)
                 pixmap = page.get_pixmap(matrix=matrix, clip=bbox, alpha=False)
                 png_bytes = pixmap.tobytes("png")
@@ -399,15 +441,16 @@ def extract_pdf_images(
                 )
 
             if page_items:
-                # 同じページに同一画像が複数回検出された場合を除外する。
                 unique: dict[str, ExtractedImage] = {}
                 for item in page_items:
                     unique[item.relative_obsidian_path] = item
                 by_page[page_number] = sorted(unique.values(), key=lambda item: item.y0)
 
-            print(f"[画像抽出] {page_number}/{document.page_count}ページ: {len(by_page.get(page_number, []))}枚")
+            print(
+                f"[画像抽出] {page_number}/{document.page_count}ページ: "
+                f"{len(by_page.get(page_number, []))}枚"
+            )
 
-    # 何も抽出されなかった場合は空フォルダを削除する。
     if not any(by_page.values()):
         try:
             assets_dir.rmdir()
@@ -426,12 +469,7 @@ def insert_images_near_captions(
     page_text: str,
     images: list[ExtractedImage],
 ) -> str:
-    """画像を対応する図キャプションの直前へ挿入する。
-
-    PDF抽出後は文章と画像の厳密な座標対応が失われるため、同じページ内の
-    「図1」「Fig. 1」などのキャプションを上から順に探し、画像も上から順に
-    対応させる。対応できない画像はページ末尾へ置く。
-    """
+    """同一ページの画像を図キャプション付近へ挿入する。"""
     if not images:
         return page_text
 
@@ -447,7 +485,6 @@ def insert_images_near_captions(
         if caption_pattern.search(paragraphs[index]):
             caption_indexes.append(index)
 
-    # 後ろから挿入してインデックスのずれを防ぐ。
     paired_count = min(len(images), len(caption_indexes))
     for pair_index in range(paired_count - 1, -1, -1):
         image = images[pair_index]
@@ -489,12 +526,14 @@ def build_source_markdown(
             page_content,
             images_by_page.get(page_number, []),
         )
-        lines.extend([
-            f"<!-- page: {page_number} -->",
-            "",
-            page_content,
-            "",
-        ])
+        lines.extend(
+            [
+                f"<!-- page: {page_number} -->",
+                "",
+                page_content,
+                "",
+            ]
+        )
 
     return "\n".join(lines).strip() + "\n"
 
@@ -534,12 +573,18 @@ def build_codex_prompt(input_markdown: str) -> str:
 
 
 def find_codex_cli() -> str:
-    """PATHからCodex CLIを探す。Windowsではnpmのcodex.cmdも対象になる。"""
-    candidates = ("codex.exe", "codex.cmd", "codex.bat", "codex") if os.name == "nt" else ("codex",)
+    """PATHからCodex CLIを探す。Windowsではnpmのラッパーも対象にする。"""
+    candidates = (
+        ("codex.exe", "codex.cmd", "codex.bat", "codex")
+        if os.name == "nt"
+        else ("codex",)
+    )
+
     for candidate in candidates:
         executable = shutil.which(candidate)
         if executable is not None:
             return executable
+
     raise RuntimeError(
         "Codex CLIが見つかりません。\n\n"
         "コマンドプロンプトまたはターミナルで codex --version を確認してください。"
@@ -549,10 +594,12 @@ def find_codex_cli() -> str:
 def codex_command(executable: str, *arguments: str) -> list[str]:
     """Codexの実行コマンドをOSに合わせて組み立てる。"""
     command = [executable, *arguments]
+
     if os.name == "nt" and Path(executable).suffix.lower() in {".cmd", ".bat"}:
         command_line = subprocess.list2cmdline(command)
         command_prompt = os.environ.get("COMSPEC") or shutil.which("cmd.exe") or "cmd.exe"
         return [command_prompt, "/d", "/s", "/c", command_line]
+
     return command
 
 
@@ -578,7 +625,6 @@ def check_codex_cli() -> None:
 
 def run_codex_polish(input_markdown: str) -> str:
     executable = find_codex_cli()
-
     prompt = build_codex_prompt(input_markdown)
 
     with tempfile.TemporaryDirectory(prefix="paper_codex_full_") as temp_name:
@@ -622,15 +668,14 @@ def run_codex_polish(input_markdown: str) -> str:
 
         if result.returncode != 0:
             details = result.stderr.strip() or result.stdout.strip()
-            raise RuntimeError(
-                f"Codex CLI処理に失敗しました。\n\n詳細:\n{details}"
-            )
+            raise RuntimeError(f"Codex CLI処理に失敗しました。\n\n詳細:\n{details}")
 
         if not output_path.exists():
             raise RuntimeError("Codex出力ファイルが作成されませんでした。")
 
         output = output_path.read_text(encoding="utf-8").strip()
         return clean_codex_output(output)
+
 
 def clean_codex_output(text: str) -> str:
     text = text.strip()
@@ -653,6 +698,90 @@ def clean_codex_output(text: str) -> str:
     return text
 
 
+# ============================================================
+# Codex出力の数式検査
+# ============================================================
+
+
+def extract_latex_math(text: str) -> list[str]:
+    """Markdownから独立数式と行内数式の中身を抽出する。"""
+    fragments: list[str] = []
+
+    display_pattern = re.compile(r"\$\$(.+?)\$\$", flags=re.DOTALL)
+    fragments.extend(match.group(1) for match in display_pattern.finditer(text))
+
+    without_display = display_pattern.sub("", text)
+    inline_pattern = re.compile(
+        r"(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)",
+        flags=re.DOTALL,
+    )
+    fragments.extend(match.group(1) for match in inline_pattern.finditer(without_display))
+
+    return fragments
+
+
+def inspect_latex_fragment(fragment: str) -> list[str]:
+    """Obsidianでの表示を妨げそうな形式上の問題だけを検査する。"""
+    warnings: list[str] = []
+
+    for opening, closing in (("{", "}"), ("(", ")"), ("[", "]")):
+        if fragment.count(opening) != fragment.count(closing):
+            warnings.append(f"{opening}{closing} の個数が一致しません")
+
+    begin_environments = Counter(re.findall(r"\\begin\{([^}]+)\}", fragment))
+    end_environments = Counter(re.findall(r"\\end\{([^}]+)\}", fragment))
+    if begin_environments != end_environments:
+        warnings.append(r"\begin と \end が対応していません")
+
+    if fragment.count(r"\left") != fragment.count(r"\right"):
+        warnings.append(r"\left と \right の個数が一致しません")
+
+    return warnings
+
+
+def inspect_math_output(
+    source_candidates: list[MathCandidate],
+    output_markdown: str,
+) -> list[str]:
+    """数式出力を検査する。警告があっても翻訳結果は不採用にしない。"""
+    warnings: list[str] = []
+    formulas = extract_latex_math(output_markdown)
+
+    high_candidates = [
+        candidate for candidate in source_candidates if candidate.confidence == "high"
+    ]
+    if high_candidates and not formulas:
+        warnings.append(
+            "高信頼度の数式候補が存在しましたが、出力にLaTeX数式が見つかりません。"
+        )
+
+    for index, formula in enumerate(formulas, start=1):
+        for problem in inspect_latex_fragment(formula):
+            warnings.append(f"出力数式{index}: {problem}")
+
+    source_numbers = {
+        candidate.equation_number
+        for candidate in source_candidates
+        if candidate.equation_number is not None
+    }
+
+    output_numbers = set(re.findall(r"\\tag\{(\d{1,3})\}", output_markdown))
+    output_numbers.update(
+        re.findall(r"(?m)^\s*\((\d{1,3})\)\s*$", output_markdown)
+    )
+
+    missing_numbers = sorted(
+        source_numbers - output_numbers,
+        key=lambda value: int(value),
+    )
+    if missing_numbers:
+        preview = ", ".join(missing_numbers[:10])
+        suffix = " ..." if len(missing_numbers) > 10 else ""
+        warnings.append(
+            f"原文候補にあった式番号が出力で確認できません: {preview}{suffix}"
+        )
+
+    return warnings
 
 
 # ============================================================
@@ -662,12 +791,15 @@ def clean_codex_output(text: str) -> str:
 
 def safe_folder_name(name: str, max_length: int = 72) -> str:
     """PDF名からWindowsでも使用できる短いフォルダ名を作る。"""
-    cleaned = re.sub(r'[\x00-\x1f\/:*?"<>|]', "_", name)
+    cleaned = re.sub(r'[\x00-\x1f\\/:*?"<>|]', "_", name)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
     cleaned = cleaned[:max_length].rstrip(" .")
 
     reserved_names = {
-        "CON", "PRN", "AUX", "NUL",
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
         *(f"COM{number}" for number in range(1, 10)),
         *(f"LPT{number}" for number in range(1, 10)),
     }
@@ -680,26 +812,23 @@ def safe_folder_name(name: str, max_length: int = 72) -> str:
 def create_output_layout(pdf_path: Path) -> tuple[Path, Path]:
     """分類/pdf/論文.pdf から 分類/papers/論文名/ を作る。"""
     pdf_dir = pdf_path.parent
-    category_dir = pdf_dir.parent if pdf_dir.name.lower() == 'pdf' else pdf_dir
-    papers_dir = category_dir / 'papers'
+    category_dir = pdf_dir.parent if pdf_dir.name.lower() == "pdf" else pdf_dir
+    papers_dir = category_dir / "papers"
     papers_dir.mkdir(parents=True, exist_ok=True)
 
     base_name = safe_folder_name(pdf_path.stem)
     paper_dir = papers_dir / base_name
-
-    # 同じPDFを再処理する場合は同じフォルダを更新する。
     paper_dir.mkdir(parents=True, exist_ok=True)
-    assets_dir = paper_dir / 'assets'
+
+    assets_dir = paper_dir / "assets"
     return paper_dir, assets_dir
 
 
 def build_pdf_link(pdf_path: Path, markdown_dir: Path) -> str:
     """最終Markdown先頭に置く原PDFへの相対Markdownリンク。"""
     relative = Path(os.path.relpath(pdf_path, markdown_dir)).as_posix()
-    encoded = '/'.join(quote(part) for part in relative.split('/'))
-    return f'[原文PDF]({encoded})'
-
-
+    encoded = "/".join(quote(part) for part in relative.split("/"))
+    return f"[原文PDF]({encoded})"
 
 
 # ============================================================
@@ -743,9 +872,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_arguments(argv)
     interactive = args.pdf is None
     pdf_path = select_pdf_file() if interactive else args.pdf.expanduser().resolve()
+
     if pdf_path is None:
         print("PDFの選択がキャンセルされました。")
         return 0
+
     if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
         message = f"PDFファイルが見つかりません。\n\n{pdf_path}"
         print(f"\n[エラー]\n{message}", file=sys.stderr)
@@ -765,6 +896,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         skip_codex = SKIP_CODEX or args.skip_codex
+
         if not skip_codex:
             print("\n1/5 Codex CLIを確認しています。")
             check_codex_cli()
@@ -772,10 +904,22 @@ def main(argv: list[str] | None = None) -> int:
             print("\n1/5 Codex CLI確認をスキップします。")
 
         print("\n2/5 PDFから文章を取得しています。")
-        original_pages = extract_pdf_text(pdf_path)
+        original_pages, codex_pages, math_candidates = extract_pdf_text(pdf_path)
+
         if not any(text.strip() for text in original_pages):
             raise RuntimeError("PDFから文章を取得できませんでした。")
+
         save_original_text(original_path, original_pages)
+        high_count = sum(
+            candidate.confidence == "high" for candidate in math_candidates
+        )
+        medium_count = sum(
+            candidate.confidence == "medium" for candidate in math_candidates
+        )
+        print(
+            f"  数式候補合計: {len(math_candidates)}件 "
+            f"(high={high_count}, medium={medium_count})"
+        )
 
         print("\n3/5 PDF画像を抽出しています。")
         images_by_page = extract_pdf_images(pdf_path, assets_dir)
@@ -784,32 +928,44 @@ def main(argv: list[str] | None = None) -> int:
 
         source_markdown = build_source_markdown(
             pdf_link_line=pdf_link_line,
-            original_pages=original_pages,
+            original_pages=codex_pages,
             images_by_page=images_by_page,
         )
 
         if skip_codex:
             print("\n4/5 Codex処理は設定によりスキップされました。")
-            final_text = source_markdown
+            final_text = remove_math_candidate_markers(source_markdown)
         else:
             print("\n4/5 Codex CLIで英語原文を日本語へ直接翻訳・整形しています。")
             print(f"  使用モデル: {CODEX_MODEL}")
             print(f"  プロンプト: {get_prompt_path()}")
             print(f"  推論量: {CODEX_REASONING_EFFORT}")
             print("  Google翻訳は使用しません。")
-            print("  抽出した英語全文を渡し、日本語翻訳・構造復元・数式整形を1回で行います。")
+            print(
+                "  抽出した英語全文を渡し、日本語翻訳・構造復元・数式整形を1回で行います。"
+            )
 
             try:
                 candidate = run_codex_polish(source_markdown)
                 if not candidate.strip():
                     raise RuntimeError("Codexの出力が空でした。")
 
-                final_text = candidate
+                final_text = remove_math_candidate_markers(candidate)
+
+                math_warnings = inspect_math_output(math_candidates, final_text)
+                if math_warnings:
+                    print("  [数式確認]")
+                    for warning in math_warnings:
+                        print(f"    - {warning}")
+
                 print("  Codex翻訳版を最終結果として採用します。")
             except Exception as exc:
-                # 翻訳結果が作れないことを避けるため、Codex失敗時は英語抽出版を保存する。
-                final_text = source_markdown
-                print(f"  [警告] Codex処理に失敗したため英語抽出版を保存します: {exc}")
+                # 翻訳が失敗しても抽出内容を失わない。
+                final_text = remove_math_candidate_markers(source_markdown)
+                print(
+                    "  [警告] Codex処理に失敗したため英語抽出版を保存します: "
+                    f"{exc}"
+                )
 
         print("\n5/5 最終ファイルを保存しています。")
         final_path.write_text(final_text.rstrip() + "\n", encoding="utf-8")
@@ -833,6 +989,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if interactive:
         show_success(paths)
+
     return 0
 
 

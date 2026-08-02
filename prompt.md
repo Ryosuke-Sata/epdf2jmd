@@ -21,6 +21,17 @@
 - 指示語の参照対象を文脈から判断する。`the former`、`the latter`、`this method`、`the proposed approach`などを曖昧なまま訳さない。
 - `location`、`place`、`localization`など、ロボティクス分野で意味が異なる語を文脈に応じて訳し分ける。
 
+## 数式候補マーカー
+
+- `<!-- math-candidate ... -->` と `<!-- /math-candidate -->` で囲まれた部分は、PDF抽出時に数式または数式断片である可能性があると判定された原文である。
+- マーカーは補助情報であり、数式本文の一部ではない。
+- `confidence="high"` は比較的数式らしい候補、`confidence="medium"` は誤判定を含み得る候補を表す。
+- 囲まれた数値、変数、添字、演算子、式番号を安易に削除しない。
+- 前後の英語説明と照合して、Obsidian向けLaTeXへ修復する。
+- 判断に確信が持てない場合は、新しい変数や演算子を作るよりも、原文断片の情報を可能な限り残すことを優先する。
+- 同じ数式断片を重複して出力しない。
+- 最終出力には `math-candidate` コメントを含めない。
+
 ## Obsidian向け数式
 
 - 数式はObsidianで表示できるMathJax互換LaTeXへ整形する。
