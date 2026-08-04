@@ -24,7 +24,7 @@ import pymupdf
 
 # Codex CLI
 CODEX_MODEL = "gpt-5.6-luna"
-CODEX_REASONING_EFFORT = "low"
+CODEX_REASONING_EFFORT = "medium"
 CODEX_TIMEOUT_SECONDS = 1800
 SKIP_CODEX = False
 PROMPT_FILENAME = "prompt.md"
@@ -104,6 +104,7 @@ class ExtractedTable:
     page_number: int
     table_index: int
     caption: str
+    caption_bbox: tuple[float, float, float, float]
     data_bbox: tuple[float, float, float, float]
     markdown: str
     relative_obsidian_path: str
@@ -112,8 +113,7 @@ class ExtractedTable:
 
 @dataclass(frozen=True)
 class PageElement:
-    y0: float
-    x0: float
+    order: float
     content: str
 
 
@@ -467,7 +467,7 @@ def find_raster_image_after_caption(
 
 def detect_caption_table_regions(
     page: pymupdf.Page,
-) -> list[tuple[str, pymupdf.Rect]]:
+) -> list[tuple[str, pymupdf.Rect, pymupdf.Rect]]:
     """
     表番号と罫線から表本体の領域を推定する。
 
@@ -476,7 +476,7 @@ def detect_caption_table_regions(
     """
     captions = find_table_captions(page)
     rules = find_horizontal_table_rules(page)
-    regions: list[tuple[str, pymupdf.Rect]] = []
+    regions: list[tuple[str, pymupdf.Rect, pymupdf.Rect]] = []
 
     for caption_index, (caption_bbox, caption_text) in enumerate(captions):
         next_caption_y = (
@@ -532,7 +532,9 @@ def detect_caption_table_regions(
                 x1 = max(rule.x1 for rule in continuous_rules)
                 y0 = top_rule.y0
                 y1 = max(rule.y1 for rule in continuous_rules)
-                regions.append((caption_text, pymupdf.Rect(x0, y0, x1, y1)))
+                regions.append(
+                    (caption_text, caption_bbox, pymupdf.Rect(x0, y0, x1, y1))
+                )
                 continue
 
         raster_bbox = find_raster_image_after_caption(
@@ -541,7 +543,7 @@ def detect_caption_table_regions(
             next_caption_y,
         )
         if raster_bbox is not None:
-            regions.append((caption_text, raster_bbox))
+            regions.append((caption_text, caption_bbox, raster_bbox))
 
     return regions
 
@@ -635,7 +637,10 @@ def extract_tables_from_page(
     regions = detect_caption_table_regions(page)
     extracted: list[ExtractedTable] = []
 
-    for table_index, (caption, detected_bbox) in enumerate(regions, start=1):
+    for table_index, (caption, caption_bbox, detected_bbox) in enumerate(
+        regions,
+        start=1,
+    ):
         expanded_clip = pymupdf.Rect(
             max(page.rect.x0, detected_bbox.x0 - 5),
             max(page.rect.y0, detected_bbox.y0 - 5),
@@ -666,6 +671,7 @@ def extract_tables_from_page(
                 page_number=page_number,
                 table_index=table_index,
                 caption=caption,
+                caption_bbox=tuple(float(value) for value in caption_bbox),
                 data_bbox=tuple(float(value) for value in table_bbox),
                 markdown=markdown,
                 relative_obsidian_path=relative_path,
@@ -716,25 +722,46 @@ def table_to_raw_content(table: ExtractedTable) -> str:
     return f"[TABLE IMAGE: {table.relative_obsidian_path}]"
 
 
+def make_table_token(page_number: int, table_index: int) -> str:
+    """Codexに変更させない表画像用の短い固定トークンを返す。"""
+    return f"ZXQTABLEP{page_number:03d}I{table_index:02d}QXZ"
+
+
+def make_image_token(page_number: int, image_index: int) -> str:
+    """Codexに変更させない図画像用の短い固定トークンを返す。"""
+    return f"ZXQIMAGEP{page_number:03d}I{image_index:02d}QXZ"
+
+
 def table_to_codex_content(table: ExtractedTable) -> str:
-    structured_value = "true" if table.structured else "false"
-    marker = (
-        f'<!-- extracted-table page="{table.page_number}" '
-        f'index="{table.table_index}" structured="{structured_value}" '
-        f'source-image="{table.relative_obsidian_path}" -->'
-    )
-
-    contents: list[str] = [marker]
-
+    """構造化表は本文として渡し、画像表は固定トークンで保護する。"""
     if table.structured and table.markdown:
-        contents.append(table.markdown)
+        contents = [table.markdown]
         if EMBED_STRUCTURED_TABLE_IMAGES and table.relative_obsidian_path:
-            contents.append(f"![[{table.relative_obsidian_path}]]")
-    else:
-        contents.append(f"![[{table.relative_obsidian_path}]]")
+            contents.append(make_table_token(table.page_number, table.table_index))
+        return "\n\n".join(contents)
 
-    contents.append("<!-- /extracted-table -->")
-    return "\n".join(contents)
+    return make_table_token(table.page_number, table.table_index)
+
+
+def table_caption_matches_block(
+    table: ExtractedTable,
+    block_rect: pymupdf.Rect,
+    normalized_text: str,
+) -> bool:
+    """表キャプションを含む本文ブロックかを座標と文字列で判定する。"""
+    caption_rect = pymupdf.Rect(table.caption_bbox)
+    center = pymupdf.Point(
+        (caption_rect.x0 + caption_rect.x1) / 2,
+        (caption_rect.y0 + caption_rect.y1) / 2,
+    )
+    if block_rect.contains(center):
+        return True
+
+    normalized_caption = normalize_text_block(table.caption)
+    if normalized_caption and normalized_caption in normalized_text:
+        return True
+
+    return False
 
 
 # ============================================================
@@ -767,13 +794,26 @@ def extract_text_from_blocks(
     page_number: int,
     tables: list[ExtractedTable],
 ) -> tuple[str, str, list[MathCandidate]]:
-    """本文と表を座標順にまとめ、保存用・Codex用の2種類を返す。"""
-    blocks = page.get_text("blocks")
+    """PyMuPDFの元ブロック順を保ち、表を対応キャプション直後へ挿入する。"""
+    blocks = page.get_text("blocks", sort=False)
     table_rects = [pymupdf.Rect(table.data_bbox) for table in tables]
 
     raw_elements: list[PageElement] = []
     codex_elements: list[PageElement] = []
     candidates: list[MathCandidate] = []
+    inserted_table_indexes: set[int] = set()
+    order = 0.0
+
+    def append_table(table: ExtractedTable) -> None:
+        nonlocal order
+        order += 0.01
+        raw_elements.append(
+            PageElement(order=order, content=table_to_raw_content(table))
+        )
+        codex_elements.append(
+            PageElement(order=order, content=table_to_codex_content(table))
+        )
+        inserted_table_indexes.add(table.table_index)
 
     for block_index, block in enumerate(blocks, start=1):
         block_type = int(block[6]) if len(block) > 6 else 0
@@ -781,20 +821,18 @@ def extract_text_from_blocks(
             continue
 
         block_rect = pymupdf.Rect(block[0], block[1], block[2], block[3])
-        if any(rect_overlap_ratio(block_rect, table_rect) >= 0.5 for table_rect in table_rects):
+        if any(
+            rect_overlap_ratio(block_rect, table_rect) >= 0.5
+            for table_rect in table_rects
+        ):
             continue
 
         normalized = normalize_text_block(str(block[4]))
         if not normalized:
             continue
 
-        raw_elements.append(
-            PageElement(
-                y0=float(block_rect.y0),
-                x0=float(block_rect.x0),
-                content=normalized,
-            )
-        )
+        order += 1.0
+        raw_elements.append(PageElement(order=order, content=normalized))
 
         confidence, equation_number = classify_math_block(normalized)
         if confidence is None:
@@ -816,33 +854,20 @@ def extract_text_from_blocks(
                 equation_number=equation_number,
             )
 
-        codex_elements.append(
-            PageElement(
-                y0=float(block_rect.y0),
-                x0=float(block_rect.x0),
-                content=codex_content,
-            )
-        )
+        codex_elements.append(PageElement(order=order, content=codex_content))
 
+        # 表は一般の座標ソートへ混ぜず、対応するTABLEキャプションの直後に固定する。
+        for table in tables:
+            if table.table_index in inserted_table_indexes:
+                continue
+            if table_caption_matches_block(table, block_rect, normalized):
+                append_table(table)
+
+    # キャプションブロックを特定できなかった表も削除せず、検出順でページ末尾に残す。
     for table in tables:
-        table_rect = pymupdf.Rect(table.data_bbox)
-        raw_elements.append(
-            PageElement(
-                y0=float(table_rect.y0),
-                x0=float(table_rect.x0),
-                content=table_to_raw_content(table),
-            )
-        )
-        codex_elements.append(
-            PageElement(
-                y0=float(table_rect.y0),
-                x0=float(table_rect.x0),
-                content=table_to_codex_content(table),
-            )
-        )
-
-    raw_elements.sort(key=lambda element: (round(element.y0, 1), round(element.x0, 1)))
-    codex_elements.sort(key=lambda element: (round(element.y0, 1), round(element.x0, 1)))
+        if table.table_index not in inserted_table_indexes:
+            order += 1.0
+            append_table(table)
 
     return (
         "\n\n".join(element.content for element in raw_elements),
@@ -1003,15 +1028,21 @@ def insert_images_near_captions(
     for pair_index in range(paired_count - 1, -1, -1):
         image = images[pair_index]
         caption_index = caption_indexes[pair_index]
-        embed = f"![[{image.relative_obsidian_path}]]\n\n"
+        embed = (
+            make_image_token(image.page_number, pair_index + 1)
+            + "\n\n"
+        )
         paragraphs.insert(caption_index, embed)
 
     result = "".join(paragraphs).strip()
 
     if len(images) > paired_count:
         remaining = "\n\n".join(
-            f"![[{image.relative_obsidian_path}]]"
-            for image in images[paired_count:]
+            make_image_token(image.page_number, image_index)
+            for image_index, image in enumerate(
+                images[paired_count:],
+                start=paired_count + 1,
+            )
         )
         result = f"{result}\n\n{remaining}".strip()
 
@@ -1050,6 +1081,58 @@ def build_source_markdown(
         )
 
     return "\n".join(lines).strip() + "\n"
+
+
+def build_protected_asset_map(
+    tables_by_page: dict[int, list[ExtractedTable]],
+    images_by_page: dict[int, list[ExtractedImage]],
+) -> dict[str, str]:
+    """固定トークンと最終的なObsidian画像リンクの対応表を作る。"""
+    protected: dict[str, str] = {}
+
+    for page_number, images in images_by_page.items():
+        for image_index, image in enumerate(images, start=1):
+            protected[make_image_token(page_number, image_index)] = (
+                f"![[{image.relative_obsidian_path}]]"
+            )
+
+    for page_tables in tables_by_page.values():
+        for table in page_tables:
+            protected[make_table_token(table.page_number, table.table_index)] = (
+                f"![[{table.relative_obsidian_path}]]"
+            )
+
+    return protected
+
+
+def restore_protected_assets(
+    text: str,
+    protected_assets: dict[str, str],
+) -> str:
+    """Codex出力中の固定トークンをPython側で画像リンクへ戻す。"""
+    result = text
+    for token, markdown in protected_assets.items():
+        result = result.replace(token, markdown)
+    return result
+
+
+def inspect_protected_asset_tokens(
+    source_markdown: str,
+    output_markdown: str,
+    protected_assets: dict[str, str],
+) -> list[str]:
+    """Codexが固定トークンを欠落・複製した場合に警告する。"""
+    warnings: list[str] = []
+    for token in protected_assets:
+        source_count = source_markdown.count(token)
+        if source_count == 0:
+            continue
+        output_count = output_markdown.count(token)
+        if output_count != source_count:
+            warnings.append(
+                f"{token}: 入力{source_count}個、出力{output_count}個"
+            )
+    return warnings
 
 
 def get_prompt_path() -> Path:
@@ -1540,10 +1623,17 @@ def main(argv: list[str] | None = None) -> int:
             original_pages=codex_pages,
             images_by_page=images_by_page,
         )
+        protected_assets = build_protected_asset_map(
+            tables_by_page,
+            images_by_page,
+        )
 
         if skip_codex:
             print("\n4/5 Codex処理は設定によりスキップされました。")
-            final_text = remove_extraction_markers(source_markdown)
+            final_text = restore_protected_assets(
+                remove_extraction_markers(source_markdown),
+                protected_assets,
+            )
         else:
             print("\n4/5 Codex CLIで英語原文を日本語へ直接翻訳・整形しています。")
             print(f"  使用モデル: {CODEX_MODEL}")
@@ -1559,7 +1649,20 @@ def main(argv: list[str] | None = None) -> int:
                 if not candidate.strip():
                     raise RuntimeError("Codexの出力が空でした。")
 
-                final_text = remove_extraction_markers(candidate)
+                token_warnings = inspect_protected_asset_tokens(
+                    source_markdown,
+                    candidate,
+                    protected_assets,
+                )
+                if token_warnings:
+                    print("  [図表トークン確認]")
+                    for warning in token_warnings:
+                        print(f"    - {warning}")
+
+                final_text = restore_protected_assets(
+                    remove_extraction_markers(candidate),
+                    protected_assets,
+                )
 
                 math_warnings = inspect_math_output(math_candidates, final_text)
                 if math_warnings:
@@ -1576,7 +1679,10 @@ def main(argv: list[str] | None = None) -> int:
                 print("  Codex翻訳版を最終結果として採用します。")
             except Exception as exc:
                 # 翻訳が失敗しても抽出内容を失わない。
-                final_text = remove_extraction_markers(source_markdown)
+                final_text = restore_protected_assets(
+                    remove_extraction_markers(source_markdown),
+                    protected_assets,
+                )
                 print(
                     "  [警告] Codex処理に失敗したため英語抽出版を保存します: "
                     f"{exc}"
