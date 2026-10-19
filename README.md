@@ -1,170 +1,100 @@
 # epdf2jmd
 
-英語論文のPDFからテキストと画像を抽出し、Codex CLIで日本語のObsidian向けMarkdownへ翻訳・整形するPythonスクリプトです。
+英語論文PDFを、日本語のObsidian向けMarkdownへ変換するPythonプログラムです。PDFの文字・位置・フォント情報を保存し、ページ画像もCodex CLIへ渡して翻訳と数式の復元を行います。特定の論文名、式、ページ番号、用語の固定ルールは使用しません。
 
-PyMuPDFでページごとのテキストブロックとラスター画像を取得し、`prompt.md`の指示と抽出結果をCodexへ一括で渡します。Codexは翻訳に加え、二段組による読み順の乱れ、見出し、数式、表、参考文献などの復元を試みます。
+## 動作環境と準備
 
-## 主な機能
+- Python 3.10以降、PyMuPDF 1.26以降
+- 画像入力、`exec`、`--output-schema`、`--ignore-user-config`に対応したCodex CLI（検証環境: 0.145.0）
+- Codex CLIの認証が完了していること
+- PDF選択ダイアログを使う場合のみTkが必要
 
-- PDFのテキストブロックを座標順に抽出し、行末ハイフンで分割された英単語を結合
-- 一定サイズ以上のラスター画像をPNGで保存し、Obsidianの`![[assets/...]]`形式で原稿へ挿入
-- 原文PDFへの相対リンクをMarkdownの先頭に追加
-- Codex CLIによる英語から日本語への翻訳とMarkdown整形
-- Codexを使用せず、抽出内容だけを確認できる`--skip-codex`オプション
-- 引数なしで起動した場合のPDFファイル選択ダイアログ
-
-OCRは実装していません。画像としてスキャンされた文字は抽出できません。
-
-## 動作環境
-
-- Python 3.10以降
-- Codex CLI（翻訳を行う場合）
-- PythonのTkサポート（ファイル選択ダイアログを使う場合）
-
-Pythonパッケージの依存関係は`requirements.txt`に記載されています。
-
-## セットアップ
-
-### Windows
-
-コマンドプロンプトまたはPowerShellで実行します。
-
-```bat
-cd path\to\epdf2jmd
+```powershell
 python -m venv .venv
-.venv\Scripts\python -m pip install -r requirements.txt
+.venv/Scripts/python -m pip install -r requirements.txt
 codex --version
 ```
 
-### macOS / Linux
+macOS / Linuxでは`.venv/bin/python`を使用します。
 
-```sh
-cd /path/to/epdf2jmd
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-codex --version
+## 実行
+
+```powershell
+.venv/Scripts/python epdf2jmd.py "C:/path/to/paper.pdf"
 ```
 
-Codexを使用する場合は、実行前にCodex CLIの認証を完了してください。`codex --version`が失敗する場合は、Codex CLIがインストールされ、`PATH`から実行できることを確認します。Windowsでは`codex.exe`、`codex.cmd`、`codex.bat`も自動検出します。
+PDFを省略すると選択ダイアログが開きます。保存先を指定する場合:
 
-## 使い方
-
-### PDFを指定して実行する
-
-Windows:
-
-```bat
-.venv\Scripts\python epdf2jmd.py "C:\path\to\paper.pdf"
+```powershell
+.venv/Scripts/python epdf2jmd.py "C:/path/to/paper.pdf" --output-dir "C:/path/to/result"
 ```
 
-macOS / Linux:
+抽出だけを確認する場合:
 
-```sh
-.venv/bin/python epdf2jmd.py "/path/to/paper.pdf"
+```powershell
+.venv/Scripts/python epdf2jmd.py "C:/path/to/paper.pdf" --skip-codex
 ```
 
-### ファイル選択ダイアログを使う
+`--skip-codex`は英語の抽出ファイルと画像だけを保存し、日本語訳を更新しません。
 
-PDF引数を省略すると、PDFを選択するダイアログが開きます。
+## 主な変更
 
-```sh
-.venv/bin/python epdf2jmd.py
-```
+- 1段組・2段組と、ページ幅をまたぐタイトル・図表を考慮して読み順を組み立てます。
+- 上付き・下付きや分数が別PDFブロックになっている場合、重なりから同じ文章・数式へまとめます。行をまたぐ数式の継続も結合します。
+- 図、表、アルゴリズムを画像として保持します。表はセルの推定値を出す代わりに元画像を使い、列・数値・脚注を維持します。`Table`などの大小文字に対応します。
+- 各段落・数式等にIDを付け、ページごとに翻訳します。全IDの存在・重複、数値の欠落、数式の区切り、波括弧、LaTeX環境、式番号を検査します。
+- 数式や変換方向を含む単位は、翻訳後に原文とページ画像を再照合します。
+- 図表の画像リンクはPythonが生成します。翻訳モデルにパスや画像トークンを生成させません。
+- 参考文献は原文のまま残し、ブロック・段をまたぐ断片を連結して文献番号で分けます。
+- 抽出範囲に不確実性があるページは、原ページ画像も最終Markdownへ挿入します。
+- 成功したページを保存し、再実行時には検証済み結果を再利用します。入力・プロンプト・モデル設定が変わった場合は該当キャッシュを更新します。
+- 全ページの処理が成功するまで最終日本語訳を更新しません。成功時も既存訳を`.history/`に保存してから置き換えます。失敗は終了コード1になります。
 
-Windowsでは次のように実行します。
+## 出力
 
-```bat
-.venv\Scripts\python epdf2jmd.py
-```
+保存先の指定を省略すると、PDFの近くの`papers/<短い論文名>-<入力パスのハッシュ>/`へ保存します。同名や短縮名が衝突する別PDFを区別します。
 
-### Codexを使わずに抽出する
-
-```sh
-.venv/bin/python epdf2jmd.py --skip-codex "/path/to/paper.pdf"
-```
-
-この場合もテキストと画像は抽出されますが、`[ja]翻訳.md`には日本語訳ではなく、Codexへ渡す予定だった英語の抽出Markdownが保存されます。Codex CLIのインストールや認証は不要です。
-
-利用可能な引数は次のコマンドでも確認できます。
-
-```sh
-.venv/bin/python epdf2jmd.py --help
-```
-
-## 出力先
-
-出力先は入力PDFの位置から自動的に決まります。
-
-- PDFが`<分類>/pdf/論文名.pdf`にある場合: `<分類>/papers/論文名/`
-- それ以外の場所にある場合: `<PDFと同じフォルダ>/papers/論文名/`
-
-たとえば、入力が次の場所にある場合:
-
-```text
-robotics/
-└── pdf/
-    └── sample-paper.pdf
-```
-
-出力は次の構成になります。
-
-```text
-robotics/
-├── pdf/
-│   └── sample-paper.pdf
-└── papers/
-    └── sample-paper/
-        ├── [en]原文抽出.txt
-        ├── [ja]翻訳.md
-        └── assets/
-            ├── page_001_image_01.png
-            └── ...
-```
-
-`assets/`は対象となる画像が1枚もない場合には残りません。
-
-| 出力 | 内容 |
+| ファイル | 内容 |
 | --- | --- |
-| `[en]原文抽出.txt` | ページ区切り付きの英語テキスト抽出結果 |
-| `[ja]翻訳.md` | 原文PDFへの相対リンクを含む、日本語翻訳・整形結果 |
-| `assets/` | PDFから抽出した画像のPNGファイル |
+| `[ja]翻訳.md` | 検査を通過した日本語Markdown。失敗時・抽出のみの場合は更新しない |
+| `[en]原文抽出.txt` | 正規化前の文字抽出結果。ページ単位で保存 |
+| `[en]抽出.md` | 図表を配置した英語の抽出Markdown |
+| `source-layout.json` | 単位ID・座標・文字・フォント等の情報 |
+| `assets/<PDFのハッシュ>/` | 図・表・アルゴリズム・必要に応じた原ページ画像 |
+| `validation.json` | 実行状態、各ページの検査・照合件数、警告・エラー |
+| `.cache/` | ページ画像、翻訳・照合結果、試行ごとのログ。途中再開に使用 |
+| `.history/` | 成功時に置き換えられた過去の日本語訳 |
 
-同じPDFを再処理すると同じ出力フォルダを使用し、同名の出力ファイルと画像を上書きします。
+Obsidianへ移す場合は`[ja]翻訳.md`と`assets/`を同じ相対位置でコピーしてください。原PDFのリンクは実行時の位置に対する相対リンクです。
 
-## 処理の流れ
+## オプション
 
-1. 入力PDFと出力先を決定する
-2. Codexを使う場合はCLIを検出し、起動できることを確認する
-3. PyMuPDFでページごとのテキストを抽出し、`[en]原文抽出.txt`へ保存する
-4. 条件を満たすラスター画像をページ上の表示領域からPNGとして抽出する
-5. 原文PDFリンク、ページコメント、本文、画像埋め込みを含む英語Markdownを組み立てる
-6. `prompt.md`と英語Markdownの全文を1回のCodex CLI実行へ渡す
-7. 結果を`[ja]翻訳.md`へ保存する
-
-Codexの処理に失敗した場合も、抽出結果を失わないように英語の抽出Markdownを`[ja]翻訳.md`へ保存し、コンソールへ警告を表示します。
-
-## 現在の設定
-
-次の値はコマンドライン引数ではなく、`epdf2jmd.py`冒頭の定数で設定されています。
-
-| 設定 | 現在値 | 内容 |
+| オプション | 初期値 | 内容 |
 | --- | --- | --- |
-| `CODEX_MODEL` | `gpt-5.6-luna` | Codexで使用するモデル |
-| `CODEX_REASONING_EFFORT` | `low` | 推論量 |
-| `CODEX_TIMEOUT_SECONDS` | `1800` | Codex処理のタイムアウト秒数 |
-| `EXTRACT_IMAGES` | `True` | 画像抽出の有効・無効 |
-| `MIN_IMAGE_WIDTH` | `160` | 抽出する画像の最小幅 |
-| `MIN_IMAGE_HEIGHT` | `100` | 抽出する画像の最小高さ |
-| `MIN_IMAGE_AREA` | `30000` | 抽出する画像の最小面積 |
-| `IMAGE_RENDER_SCALE` | `2.0` | 画像領域をPNG化するときの倍率 |
+| `--output-dir` | 自動 | 保存先 |
+| `--model` | `gpt-5.6-luna` | 変換・照合モデル。アカウントで利用可能な画像対応モデルを指定 |
+| `--reasoning-effort` | `medium` | `low` / `medium` / `high` |
+| `--timeout` | `1800` | 1回のCLI実行の上限秒数 |
+| `--retries` | `1` | ページの検証・照合失敗時の追加試行回数 |
+| `--no-resume` | 無効 | 既存の翻訳・照合キャッシュを再利用しない |
+| `--no-review` | 無効 | 数式・変換方向の追加照合を省略 |
+| `--skip-codex` | 無効 | 抽出のみ |
 
-翻訳・整形の方針を変更する場合は、`epdf2jmd.py`と同じフォルダにある`prompt.md`を編集してください。ファイルが存在しない、または空の場合はCodex処理を開始できません。
+CLIはユーザーの追加ツール設定を読み込まず、読み取り専用の実行環境で使用します。翻訳規則は`prompt.md`、照合規則はプログラム内の`review_translation`で定義しています。
 
-## 制限事項と注意
+## 検査の範囲と制限
 
-- OCRを行わないため、スキャン画像だけで構成されたPDFには対応していません。
-- テキストはブロックの縦・横座標で並べます。複雑な二段組、表、数式の抽出順は崩れることがあり、その修復は主にCodexへの指示に依存します。
-- 画像抽出の対象はPDF内で検出できるラスター画像です。ベクター図形やページ全体のレイアウトをそのまま画像化する機能ではありません。
-- 画像とキャプションは、同一ページ内で上から順に対応付けます。正確に対応できない画像はそのページの末尾へ配置されます。
-- 翻訳実行時は、抽出したPDF本文と`prompt.md`の内容がCodex CLIへ送信されます。機密文書を扱う場合は利用条件を確認するか、`--skip-codex`を使用してください。
-- PDF名から作る出力フォルダ名は、Windowsで使用できない文字を`_`へ置換し、最大72文字に短縮します。
+- 検査合格は、翻訳の意味やすべての数式が完全に正しいことを保証しません。重要な式・符号・変換方向は原PDFとも照合してください。
+- 数値の保持検査は欠落を検出するもので、同じ数値の誤った割り当てまでは保証しません。表を画像で保持するのは、この種の誤変換を避けるためです。
+- 複雑な3段組、回転文字、見出しやキャプションのない図表、特殊な配置には読順や領域検出の限界があります。検出に不確実性がある場合は警告と原ページ画像を残します。
+- 文字のないスキャンページは、モデルによる画像からの読み取りを試み、原ページ画像も残します。専用OCRエンジンは使いません。
+- ページ・段をまたぐ文は意味を保って翻訳しますが、段落が分かれて残る場合があります。
+- ページ画像と抽出本文はCodexへ送信されます。1ページごとの翻訳に加えて数式等の照合を行うため、旧版の全文1回送信より実行回数が増えます。
+
+## 自動テスト
+
+```powershell
+.venv/Scripts/python -m unittest discover -s tests -v
+```
+
+段組、数式・タイトルの分断、ID・数値の欠落、LaTeXの形式、表・アルゴリズムの切り出し、画像リンク、途中再開、出力名の衝突、失敗時の既存訳保護を検証します。
