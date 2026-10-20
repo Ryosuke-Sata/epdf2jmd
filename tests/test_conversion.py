@@ -1,7 +1,10 @@
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -23,6 +26,52 @@ def unit(
 
 
 class ConversionTests(unittest.TestCase):
+    def test_native_codex_command_keeps_arguments(self):
+        arguments = ("exec", "-c", 'model_reasoning_effort="medium"', "a b/日本語.png")
+        self.assertEqual(
+            app.codex_command("codex.exe", *arguments),
+            ["codex.exe", *arguments],
+        )
+
+    @unittest.skipUnless(os.name == "nt", "Windows npm shim regression")
+    def test_npm_codex_preserves_windows_arguments_without_shell(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is not installed")
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = Path(directory) / "npm with spaces 日本語 & (test)"
+            script = prefix / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+            script.parent.mkdir(parents=True)
+            script.write_text(
+                "process.stdout.write(JSON.stringify(process.argv.slice(2)));",
+                encoding="utf-8",
+            )
+            shim = prefix / "codex.cmd"
+            shim.write_text("@exit /b 99\n", encoding="utf-8")
+            arguments = (
+                "exec", "-c", 'model_reasoning_effort="medium"',
+                "--image", str(prefix / "OneDrive - 中央大学" / "page.png"),
+                "--output-schema", str(prefix / "%PATH%! & (資料)" / "schema.json"),
+                "--output-last-message", str(prefix / "response.json"), "-",
+            )
+            for suffix in (".cmd", ".bat"):
+                with self.subTest(suffix=suffix):
+                    command = app.codex_command(str(shim.with_suffix(suffix)), *arguments)
+                    process = subprocess.run(
+                        command, capture_output=True, text=True, encoding="utf-8",
+                        check=True, timeout=30,
+                    )
+                    self.assertEqual(json.loads(process.stdout), list(arguments))
+            local_node = prefix / "node.exe"
+            shutil.copyfile(node, local_node)
+            self.assertEqual(app.codex_command(str(shim))[0], str(local_node))
+
+    @unittest.skipUnless(os.name == "nt", "Windows npm shim regression")
+    def test_unresolvable_windows_shim_reports_setup_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, "Windows起動ファイル"):
+                app.codex_command(str(Path(directory) / "codex.cmd"))
+
     def test_two_columns_with_wide_title_and_figure(self):
         units = [
             unit("r2", (310, 180, 560, 200)),

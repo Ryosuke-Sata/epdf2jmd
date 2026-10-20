@@ -748,16 +748,21 @@ def find_codex_cli() -> str:
 
 
 def codex_command(executable: str, *arguments: str) -> list[str]:
-    command = [executable, *arguments]
     if os.name == "nt" and Path(executable).suffix.lower() in (".cmd", ".bat"):
-        return [
-            os.environ.get("COMSPEC", "cmd.exe"),
-            "/d",
-            "/s",
-            "/c",
-            subprocess.list2cmdline(command),
-        ]
-    return command
+        # npm's shim passes through cmd.exe, whose quoting rules differ from
+        # subprocess's Windows argv encoding. Bypass it so paths with spaces
+        # and quoted -c values reach Codex unchanged, without shell expansion.
+        prefix = Path(executable).resolve().parent
+        script = prefix / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+        local_node = prefix / "node.exe"
+        node = str(local_node) if local_node.is_file() else shutil.which("node")
+        if not script.is_file() or not node:
+            raise RuntimeError(
+                "CodexのWindows起動ファイルを解決できません。"
+                "npm版Codex CLIとNode.js、またはcodex.exeを使用してください。"
+            )
+        return [node, str(script), *arguments]
+    return [executable, *arguments]
 
 
 def run_codex(
